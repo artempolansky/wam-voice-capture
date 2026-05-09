@@ -1,0 +1,39 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swiftc --version
+
+      - name: Build .app
+        run: bash scripts/build-app.sh
+
+      - name: Verify bundle
+        run: |
+          # Until Phase 1 rename, the binary is still named VoiceMax
+          test -d VoiceMax.app
+          test -x VoiceMax.app/Contents/MacOS/VoiceMax
+          test -f VoiceMax.app/Contents/Info.plist
+          echo "Bundle contents:"
+          ls -la VoiceMax.app/Contents/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-bundle
+          path: VoiceMax.app
+          retention-days: 14
