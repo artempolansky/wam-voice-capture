@@ -1,0 +1,821 @@
+import AppKit
+
+@MainActor
+final class StatusBarController: NSObject {
+
+    // MARK: - Properties
+
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+    /// CoreAudio deviceUID выбранного input устройства. Пусто / nil = system default.
+    private static let micDeviceUIDKey = "VoiceMaxMicDeviceUID"
+
+    private var trayState = TrayState()
+    /// FN-press: capture idempotency. FN-down кидает start, FN-up на том же нажатии — stop.
+    private var captureInFlight = false
+
+    // Tray icon: плавный grey↔red, без пульсации — солидный красный пока запись.
+    private static let iconTransitionDuration: TimeInterval = 0.35
+    private static let iconAnimFPS: Double = 30
+    private var iconBlend: CGFloat = 0
+    private var animTimer: Timer?
+
+    // FN: CGEventTap (primary) + NSEvent fallback
+    private var fnTap: FNKeyTap?
+    private var fnMonitor: Any?
+    private var fnFallbackFunctionDown = false
+    private var lastFNPressAt = Date.distantPast
+    private static let fnDebounce: TimeInterval = 0.15
+
+    private var localSession: LocalCaptureSession?
+
+    // MARK: - Init / deinit
+
+    override init() {
+        super.init()
+        setupStatusItem()
+        setupFNListener()
+        setupTelegramClient()
+        setupAudio()
+        setupMeetingSession()
+    }
+
+    private func setupTelegramClient() {
+        TelegramClient.shared.onStatusChange = { [weak self] _ in
+            Task { @MainActor [weak self] in self?.handleTelegramStatusChange() }
+        }
+        TelegramClient.shared.start()
+    }
+
+    private func setupAudio() {
+        // Hop to main before touching TrayLog — onError fires on the audio thread.
+        AudioCapture.shared.onError = { err in
+            DispatchQueue.main.async {
+                TrayLog.append("audio: error — \(err.localizedDescription)")
+            }
+        }
+        // Lamp tracks mic availability whenever it flips. We're already on
+        // main here; the publisher hops to main internally.
+        AudioCapture.shared.onAvailabilityChange = { available in
+            TrayLog.append("audio: mic availability -> \(available)")
+            LightControl.shared.set(available ? .idle : .disconnected)
+        }
+        AudioCapture.shared.onAllMicsFailed = { [weak self] in
+            guard let self else { return }
+            TrayLog.append("audio: all mics produced silence — clearing saved UID, showing MIC badge")
+            UserDefaults.standard.removeObject(forKey: Self.micDeviceUIDKey)
+            self.allMicsFailed = true
+            self.refreshTrayBadge()
+        }
+        AudioCapture.shared.onMicsRecovered = { [weak self] in
+            guard let self else { return }
+            TrayLog.append("audio: mic recovered — clearing MIC badge")
+            self.allMicsFailed = false
+            self.refreshTrayBadge()
+        }
+        let uid = UserDefaults.standard.string(forKey: Self.micDeviceUIDKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try AudioCapture.shared.setDeviceUID((uid?.isEmpty == false) ? uid : nil)
+            TrayLog.append("audio: always-on engine started (uid=\(uid ?? "default"), pre-roll \(AudioCapture.shared.preRollSeconds)s)")
+        } catch {
+            TrayLog.append("audio: bootstrap failed — \(error.localizedDescription). Will retry on FN-press.")
+        }
+        // Explicit initial — onAvailabilityChange only fires on transitions, so
+        // an unchanged false-from-start (mic missing at boot) needs a manual push.
+        LightControl.shared.setIdleReflectingMic()
+    }
+
+    /// True when AudioCapture's silence-probe cycle exhausted every input
+    /// device on the system without finding one that produces non-zero audio.
+    /// Cleared the moment the user picks a mic from the menu (which restarts
+    /// the cycle from scratch) or once a working mic is found again.
+    private var allMicsFailed = false
+
+    private func refreshTrayBadge() {
+        guard let btn = statusItem.button else { return }
+        if allMicsFailed {
+            btn.imagePosition = .imageLeft
+            btn.title = " MIC"
+            btn.toolTip = "No working microphone — every input device produced silence. Reconnect a mic or re-select from the menu to retry."
+        } else {
+            btn.imagePosition = .imageOnly
+            btn.title = ""
+            btn.toolTip = nil
+        }
+    }
+
+    deinit {
+        animTimer?.invalidate()
+        fnTap?.stop()
+        if let m = fnMonitor { NSEvent.removeMonitor(m) }
+    }
+
+    // MARK: - Status item
+
+    private func setupStatusItem() {
+        if #available(macOS 11.0, *) { statusItem.isVisible = true }
+        guard let btn = statusItem.button else { TrayLog.append("ERROR: button nil"); return }
+        btn.imagePosition  = .imageOnly
+        btn.imageHugsTitle = true
+        btn.imageScaling   = .scaleProportionallyDown
+        btn.font = NSFont.systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        btn.target = self
+        btn.action = #selector(itemClicked(_:))
+        btn.sendAction(on: [.rightMouseUp, .leftMouseUp])
+        renderUI()
+    }
+
+    // MARK: - Render
+
+    private func renderUI() {
+        applyTrayIcon()
+        syncIconAnimator()
+    }
+
+    private func applyTrayIcon() {
+        guard let btn = statusItem.button else { return }
+        btn.image = TrayIcon.crossfadeImage(blend: iconBlend)
+    }
+
+    /// Set by LocalCaptureSession.onStallChange. While true, recording icon strobes.
+    private var sessionStalled = false
+
+    private var iconBlendTarget: CGFloat { trayState.recording ? 1 : 0 }
+
+    private var needsIconAnimator: Bool {
+        if sessionStalled && trayState.recording { return true }
+        return abs(iconBlend - iconBlendTarget) > 0.002
+    }
+
+    private func syncIconAnimator() {
+        if needsIconAnimator {
+            if animTimer == nil {
+                let interval = 1.0 / Self.iconAnimFPS
+                animTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+                    Task { @MainActor [weak self] in self?.iconAnimatorStep() }
+                }
+                iconAnimatorStep()
+            }
+        } else {
+            animTimer?.invalidate()
+            animTimer = nil
+        }
+    }
+
+    private func iconAnimatorStep() {
+        if sessionStalled && trayState.recording {
+            // Strobe red between alpha 0.3 and 1.0 at 2Hz — clear "something's wrong" cue.
+            let phase = Date().timeIntervalSinceReferenceDate * 2.0 * 2.0 * .pi
+            iconBlend = 0.65 + 0.35 * CGFloat(sin(phase))
+            applyTrayIcon()
+            syncIconAnimator()
+            return
+        }
+
+        let target = iconBlendTarget
+        let step = CGFloat(1.0 / (Self.iconTransitionDuration * Self.iconAnimFPS))
+        if abs(iconBlend - target) > step * 0.5 {
+            iconBlend += (target > iconBlend) ? min(step, target - iconBlend) : max(-step, target - iconBlend)
+        } else {
+            iconBlend = target
+        }
+        applyTrayIcon()
+        syncIconAnimator()
+    }
+
+    // MARK: - Error tooltip
+
+    private func showError(_ message: String) {
+        TrayLog.append("error: \(message)")
+        guard let btn = statusItem.button else { return }
+        btn.toolTip = message
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak btn] in
+            btn?.toolTip = nil
+        }
+    }
+
+    // MARK: - Tray menu
+
+    @objc private func itemClicked(_ sender: Any?) {
+        guard let b = statusItem.button else { return }
+        buildMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: b.bounds.height), in: b)
+    }
+
+    private func buildMenu() -> NSMenu {
+        let menu = NSMenu()
+
+        addMeetingMenuItems(to: menu)
+        menu.addItem(.separator())
+
+        let dgKey = NSMenuItem(
+            title: isDeepgramKeyPresent() ? "Deepgram API key… (set)" : "Deepgram API key…",
+            action: #selector(configureDeepgramKey),
+            keyEquivalent: ""
+        )
+        dgKey.target = self
+        menu.addItem(dgKey)
+
+        let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micItem.submenu = buildMicSubmenu()
+        menu.addItem(micItem)
+
+        let lightItem = NSMenuItem(title: "Light", action: nil, keyEquivalent: "")
+        lightItem.submenu = buildLightSubmenu()
+        menu.addItem(lightItem)
+
+        menu.addItem(.separator())
+        addTelegramMenuItems(to: menu)
+
+        if #available(macOS 13.0, *) {
+            menu.addItem(.separator())
+            let login = NSMenuItem(
+                title: "Запускать при входе в систему",
+                action: #selector(toggleLaunchAtLogin(_:)),
+                keyEquivalent: ""
+            )
+            login.target = self
+            login.state = LoginItemSettings.isLaunchAtLoginEnabled ? .on : .off
+            menu.addItem(login)
+        }
+
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)),
+                               keyEquivalent: "q")
+        menu.addItem(quit)
+        return menu
+    }
+
+    // MARK: - Meeting menu
+
+    private func addMeetingMenuItems(to menu: NSMenu) {
+        if MeetingSession.shared.isRunning {
+            let header = NSMenuItem(
+                title: "Meeting recording — \(formatElapsed(MeetingSession.shared.elapsedSeconds))",
+                action: nil,
+                keyEquivalent: ""
+            )
+            header.isEnabled = false
+            menu.addItem(header)
+
+            let stop = NSMenuItem(title: "Stop meeting",
+                                  action: #selector(stopMeeting),
+                                  keyEquivalent: "")
+            stop.target = self
+            menu.addItem(stop)
+
+            if MeetingSession.shared.transcriptURL != nil {
+                let open = NSMenuItem(title: "Open transcript…",
+                                      action: #selector(openMeetingTranscript),
+                                      keyEquivalent: "")
+                open.target = self
+                menu.addItem(open)
+            }
+        } else {
+            let start = NSMenuItem(title: "Start meeting",
+                                   action: #selector(startMeeting),
+                                   keyEquivalent: "")
+            start.target = self
+            menu.addItem(start)
+
+            let openFolder = NSMenuItem(title: "Open recordings folder…",
+                                        action: #selector(openRecordingsFolder),
+                                        keyEquivalent: "")
+            openFolder.target = self
+            menu.addItem(openFolder)
+        }
+    }
+
+    private func formatElapsed(_ seconds: TimeInterval) -> String {
+        let total = Int(seconds)
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return h > 0
+            ? String(format: "%d:%02d:%02d", h, m, s)
+            : String(format: "%02d:%02d", m, s)
+    }
+
+    @objc private func startMeeting() {
+        if trayState.recording {
+            showError("FN dictation in progress — release FN before starting a meeting")
+            return
+        }
+        do {
+            try MeetingSession.shared.start()
+        } catch {
+            showError(error.localizedDescription)
+            TrayLog.append("meeting: start failed — \(error.localizedDescription)")
+        }
+    }
+
+    @objc private func stopMeeting() {
+        MeetingSession.shared.stop()
+    }
+
+    @objc private func openMeetingTranscript() {
+        guard let url = MeetingSession.shared.transcriptURL else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func openRecordingsFolder() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = docs.appendingPathComponent("VoiceMax-Recordings", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(dir)
+    }
+
+    private func setupMeetingSession() {
+        MeetingSession.shared.onStateChange = { [weak self] running in
+            guard let self else { return }
+            // Reuse the existing tray-state machinery: meeting active = red icon.
+            self.trayState.recording = running
+            self.renderUI()
+            // Lamp follows the same convention as FN dictation.
+            LightControl.shared.set(running ? .recording : .idle)
+        }
+        MeetingSession.shared.onError = { [weak self] err in
+            self?.showError(err.localizedDescription)
+        }
+    }
+
+    // MARK: - Telegram menu
+
+    #if TELEGRAM_BUILD
+    private var lastTelegramAuthStage: TelegramClient.Status = .idle
+    private var connectInFlight = false
+    #endif
+
+    private func addTelegramMenuItems(to menu: NSMenu) {
+        #if TELEGRAM_BUILD
+        let status = TelegramClient.shared.status
+        let header = NSMenuItem(title: "Telegram: \(status.menuText)", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+
+        switch status {
+        case .needCredentials, .idle, .error:
+            let creds = NSMenuItem(
+                title: KeychainHelper.telegramCredentials() == nil
+                    ? "Telegram app credentials…"
+                    : "Telegram app credentials… (set)",
+                action: #selector(configureTelegramCredentials),
+                keyEquivalent: ""
+            )
+            creds.target = self
+            menu.addItem(creds)
+
+            if KeychainHelper.telegramCredentials() != nil {
+                let connect = NSMenuItem(title: "Telegram: Connect…",
+                                         action: #selector(connectTelegram),
+                                         keyEquivalent: "")
+                connect.target = self
+                menu.addItem(connect)
+            }
+        case .ready:
+            let logout = NSMenuItem(title: "Telegram: Logout",
+                                    action: #selector(logoutTelegram),
+                                    keyEquivalent: "")
+            logout.target = self
+            menu.addItem(logout)
+        case .waitingPhone, .waitingCode, .waitingPassword:
+            break
+        }
+        #else
+        let header = NSMenuItem(title: "Telegram: TDLib not installed", action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
+        #endif
+    }
+
+    private func handleTelegramStatusChange() {
+        #if TELEGRAM_BUILD
+        let status = TelegramClient.shared.status
+        defer { lastTelegramAuthStage = status }
+        guard connectInFlight else { return }
+        guard status != lastTelegramAuthStage else { return }
+        switch status {
+        case .waitingPhone:
+            promptPhone()
+        case .waitingCode:
+            promptCode()
+        case .waitingPassword:
+            promptPassword()
+        case .ready, .idle, .error:
+            connectInFlight = false
+        default:
+            break
+        }
+        #endif
+    }
+
+    @objc private func configureTelegramCredentials() {
+        #if TELEGRAM_BUILD
+        let alert = NSAlert()
+        alert.messageText = "Telegram app credentials"
+        alert.informativeText = "Получить на my.telegram.org → API Development Tools. Сохранятся в login Keychain (voicemax.telegram.api_id / api_hash)."
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 60))
+        let idField = NSTextField(frame: NSRect(x: 0, y: 32, width: 360, height: 22))
+        idField.placeholderString = "api_id (integer)"
+        let hashField = NSTextField(frame: NSRect(x: 0, y: 2, width: 360, height: 22))
+        hashField.placeholderString = "api_hash"
+        container.addSubview(idField)
+        container.addSubview(hashField)
+        alert.accessoryView = container
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = idField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let idText = idField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hashText = hashField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let apiID = Int32(idText), !hashText.isEmpty else {
+            showError("api_id must be integer, api_hash non-empty")
+            return
+        }
+        do {
+            try KeychainHelper.setTelegramCredentials(apiID: apiID, apiHash: hashText)
+            TrayLog.append("tg: credentials saved, restarting client")
+            TelegramClient.shared.start()
+        } catch {
+            showError(error.localizedDescription)
+        }
+        #endif
+    }
+
+    @objc private func connectTelegram() {
+        #if TELEGRAM_BUILD
+        connectInFlight = true
+        let s = TelegramClient.shared.status
+        switch s {
+        case .waitingPhone:    promptPhone()
+        case .waitingCode:     promptCode()
+        case .waitingPassword: promptPassword()
+        default:
+            TelegramClient.shared.start()
+        }
+        #endif
+    }
+
+    @objc private func logoutTelegram() {
+        #if TELEGRAM_BUILD
+        let alert = NSAlert()
+        alert.messageText = "Log out of Telegram?"
+        alert.informativeText = "Сессия и ключ базы будут удалены. Для повторного подключения придётся снова ввести код."
+        alert.addButton(withTitle: "Log out")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        TelegramClient.shared.logoutAndWipe()
+        #endif
+    }
+
+    #if TELEGRAM_BUILD
+    private func promptPhone() {
+        let v = prompt(title: "Telegram phone number",
+                       info: "В международном формате, напр. +79686446490.",
+                       placeholder: "+1234567890",
+                       secure: false)
+        if let v { TelegramClient.shared.submitPhone(v) } else { connectInFlight = false }
+    }
+
+    private func promptCode() {
+        let v = prompt(title: "Verification code",
+                       info: "Код из Telegram (в мессенджере) или SMS.",
+                       placeholder: "12345",
+                       secure: false)
+        if let v { TelegramClient.shared.submitCode(v) } else { connectInFlight = false }
+    }
+
+    private func promptPassword() {
+        let v = prompt(title: "Cloud password (2FA)",
+                       info: "Пароль облачного Telegram.",
+                       placeholder: "",
+                       secure: true)
+        if let v { TelegramClient.shared.submitPassword(v) } else { connectInFlight = false }
+    }
+
+    private func prompt(title: String, info: String, placeholder: String, secure: Bool) -> String? {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = info
+        let field: NSTextField = secure
+            ? NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+            : NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = placeholder
+        alert.accessoryView = field
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return v.isEmpty ? nil : v
+    }
+    #endif
+
+    @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
+        guard #available(macOS 13.0, *) else { return }
+        let newValue = !LoginItemSettings.isLaunchAtLoginEnabled
+        do {
+            try LoginItemSettings.setLaunchAtLogin(newValue)
+            sender.state = newValue ? .on : .off
+            TrayLog.append("Launch at login: \(newValue)")
+        } catch {
+            showError(error.localizedDescription)
+            TrayLog.append("Launch at login error: \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - FN listener
+
+    private func setupFNListener() {
+        let pressHandler: () -> Void = { [weak self] in
+            Task { @MainActor in await self?.handleFNPress() }
+        }
+        let releaseHandler: () -> Void = { [weak self] in
+            Task { @MainActor in self?.handleFNRelease() }
+        }
+
+        let tap = FNKeyTap()
+        if tap.start(onPress: pressHandler, onRelease: releaseHandler) {
+            fnTap = tap
+        } else {
+            fnMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
+                let down = event.modifierFlags.contains(.function)
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if down && !self.fnFallbackFunctionDown {
+                        pressHandler()
+                    } else if !down && self.fnFallbackFunctionDown {
+                        releaseHandler()
+                    }
+                    self.fnFallbackFunctionDown = down
+                }
+            }
+            if fnMonitor == nil {
+                TrayLog.append("FN: NSEvent global monitor also nil — grant Accessibility for VoiceMax")
+            } else {
+                TrayLog.append("FN: NSEvent fallback — both edges via .function")
+            }
+        }
+    }
+
+    /// FN-down. During a meeting this is a "push-to-record-me" trigger that
+    /// flips MeetingSession's [Me] channel ON. Outside a meeting it's the
+    /// classic toggle: start session if idle, stop if already recording.
+    private func handleFNPress() async {
+        // During a meeting, FN is a hold gate for the [Me] channel — no
+        // debounce, both edges matter, no toggle dance.
+        if MeetingSession.shared.isRunning {
+            MeetingSession.shared.setMeCapture(true)
+            return
+        }
+
+        let now = Date()
+        guard now.timeIntervalSince(lastFNPressAt) >= Self.fnDebounce else {
+            TrayLog.append("FN ignored (debounce)")
+            return
+        }
+        lastFNPressAt = now
+
+        guard !captureInFlight else {
+            TrayLog.append("FN ignored: capture in flight")
+            return
+        }
+
+        if trayState.recording {
+            doStop()
+        } else {
+            doStart()
+        }
+    }
+
+    /// FN-up. Only meaningful during a meeting (closes the [Me] gate).
+    /// In FN-dictation mode the toggle is on rising-edge only.
+    private func handleFNRelease() {
+        if MeetingSession.shared.isRunning {
+            MeetingSession.shared.setMeCapture(false)
+        }
+    }
+
+    // MARK: - Local capture (Deepgram → paste)
+
+    private func doStart() {
+        captureInFlight = true
+        defer { captureInFlight = false }
+
+        trayState.recording = true
+        renderUI()
+
+        if localSession != nil {
+            TrayLog.append("local: session already running — ignoring start")
+            return
+        }
+        let s = LocalCaptureSession()
+        s.onTranscript = { text, isFinal in
+            if isFinal, !text.isEmpty {
+                TrayLog.append("local: final segment — \(text.prefix(80))")
+            }
+        }
+        s.onFinish = { text in
+            TrayLog.append("local: finished, pasted \(text.count) chars")
+        }
+        s.onStallChange = { [weak self] stalled in
+            guard let self else { return }
+            self.sessionStalled = stalled
+            self.renderUI()
+        }
+        s.onError = { [weak self] err in
+            guard let self else { return }
+            self.showError(err.localizedDescription)
+            TrayLog.append("local: error — \(err.localizedDescription)")
+        }
+        do {
+            try s.start()
+            localSession = s
+            TrayLog.append("local: session started")
+        } catch {
+            trayState.recording = false
+            renderUI()
+            showError(error.localizedDescription)
+            TrayLog.append("local: start failed — \(error.localizedDescription)")
+        }
+    }
+
+    private func doStop() {
+        captureInFlight = true
+        defer { captureInFlight = false }
+
+        trayState.recording = false
+        renderUI()
+
+        guard let s = localSession else {
+            TrayLog.append("local: stop called with no session")
+            return
+        }
+        s.stop()
+        localSession = nil
+        TrayLog.append("local: session stopped (paste pending)")
+    }
+
+    private func isDeepgramKeyPresent() -> Bool {
+        (try? KeychainHelper.deepgramAPIKey()).map { !$0.isEmpty } ?? false
+    }
+
+    private func buildMicSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Microphone")
+        let current = UserDefaults.standard.string(forKey: Self.micDeviceUIDKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        let defaultDev = AudioDevices.defaultInputDevice()
+        let defaultLabel = defaultDev.map { "System default (\($0.name))" } ?? "System default"
+        let defaultItem = NSMenuItem(title: defaultLabel, action: #selector(selectMicDefault), keyEquivalent: "")
+        defaultItem.target = self
+        defaultItem.state = current.isEmpty ? .on : .off
+        sub.addItem(defaultItem)
+
+        let devices = AudioDevices.inputDevices()
+        if !devices.isEmpty {
+            sub.addItem(.separator())
+            for dev in devices {
+                let it = NSMenuItem(title: dev.name, action: #selector(selectMicDevice(_:)), keyEquivalent: "")
+                it.target = self
+                it.representedObject = dev.uid
+                it.state = (dev.uid == current) ? .on : .off
+                sub.addItem(it)
+            }
+        }
+        return sub
+    }
+
+    @objc private func selectMicDefault() {
+        UserDefaults.standard.removeObject(forKey: Self.micDeviceUIDKey)
+        allMicsFailed = false
+        refreshTrayBadge()
+        do {
+            try AudioCapture.shared.setDeviceUID(nil)
+            TrayLog.append("mic: using system default")
+        } catch {
+            showError(error.localizedDescription)
+            TrayLog.append("mic: switch to default failed — \(error.localizedDescription)")
+        }
+    }
+
+    @objc private func selectMicDevice(_ sender: NSMenuItem) {
+        guard let uid = sender.representedObject as? String else { return }
+        UserDefaults.standard.set(uid, forKey: Self.micDeviceUIDKey)
+        allMicsFailed = false
+        refreshTrayBadge()
+        do {
+            try AudioCapture.shared.setDeviceUID(uid)
+            TrayLog.append("mic: selected \(sender.title) (\(uid))")
+        } catch {
+            showError(error.localizedDescription)
+            TrayLog.append("mic: switch to \(uid) failed — \(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - Light submenu
+
+    private func buildLightSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Light")
+
+        let endpoint = "\(LightControl.shared.host):\(LightControl.shared.port)"
+        let header = NSMenuItem(title: endpoint, action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        sub.addItem(header)
+
+        let toggle = NSMenuItem(title: "Enabled",
+                                 action: #selector(toggleLightEnabled),
+                                 keyEquivalent: "")
+        toggle.target = self
+        toggle.state = LightControl.shared.enabled ? .on : .off
+        sub.addItem(toggle)
+
+        let edit = NSMenuItem(title: "Configure host…",
+                               action: #selector(configureLightHost),
+                               keyEquivalent: "")
+        edit.target = self
+        sub.addItem(edit)
+
+        sub.addItem(.separator())
+        let test = NSMenuItem(title: "Test (red → standby)",
+                               action: #selector(testLight),
+                               keyEquivalent: "")
+        test.target = self
+        sub.addItem(test)
+
+        return sub
+    }
+
+    @objc private func toggleLightEnabled() {
+        LightControl.shared.enabled.toggle()
+        // User explicitly turned it on → give the lamp a fresh chance even
+        // if the breaker had suspended earlier on a foreign network.
+        if LightControl.shared.enabled { LightControl.shared.resetBreaker() }
+        TrayLog.append("light: enabled = \(LightControl.shared.enabled)")
+    }
+
+    @objc private func configureLightHost() {
+        let alert = NSAlert()
+        alert.messageText = "Lamp daemon endpoint"
+        alert.informativeText = "Хост и порт демона лампочки. Опционально — оставь пусто чтобы отключить."
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 60))
+        let hostField = NSTextField(frame: NSRect(x: 0, y: 32, width: 320, height: 22))
+        hostField.placeholderString = "host (e.g. mac-mini.local)"
+        hostField.stringValue = LightControl.shared.host
+        let portField = NSTextField(frame: NSRect(x: 0, y: 2, width: 320, height: 22))
+        portField.placeholderString = "port (e.g. 7420)"
+        portField.stringValue = String(LightControl.shared.port)
+        container.addSubview(hostField)
+        container.addSubview(portField)
+        alert.accessoryView = container
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = hostField
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let h = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !h.isEmpty, let p = Int(portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), p > 0 else {
+            showError("host must be non-empty, port must be a positive integer")
+            return
+        }
+        LightControl.shared.host = h
+        LightControl.shared.port = p
+        TrayLog.append("light: endpoint = \(h):\(p)")
+    }
+
+    @objc private func testLight() {
+        // Manual test — bypass any active circuit breaker so the user can
+        // verify the lamp is reachable again after moving networks.
+        LightControl.shared.resetBreaker()
+        LightControl.shared.set(.recording, bypassBreaker: true)
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            let phase: LightControl.Phase = AudioCapture.shared.isAvailable ? .idle : .disconnected
+            LightControl.shared.set(phase, bypassBreaker: true)
+        }
+    }
+
+    @objc private func configureDeepgramKey() {
+        let alert = NSAlert()
+        alert.messageText = "Deepgram API key"
+        alert.informativeText = "Сохранится в login Keychain (service voicemax.deepgram.api_key, account deepgram)."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
+        field.placeholderString = isDeepgramKeyPresent() ? "•••••••• (уже сохранён — введи новый, чтобы перезаписать)" : "сюда вставь ключ"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Сохранить")
+        alert.addButton(withTitle: "Отмена")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let key = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else { return }
+        do {
+            try KeychainHelper.setDeepgramAPIKey(key)
+            TrayLog.append("deepgram key saved to keychain")
+        } catch {
+            showError(error.localizedDescription)
+            TrayLog.append("deepgram key save failed: \(error.localizedDescription)")
+        }
+    }
+}

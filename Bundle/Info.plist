@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>VoiceMax</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.voicemax.app</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>VoiceMax</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2025</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Show errors on capture or delivery failure.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>VoiceMax needs Accessibility to detect the fn key globally for voice capture start/stop.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>VoiceMax captures microphone audio for speech-to-text transcription.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Meeting recording captures system audio so other participants on calls are transcribed alongside your voice.</string>
+</dict>
+</plist>
