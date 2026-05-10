@@ -5,25 +5,27 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>VoiceMax</string>
+	<string>WAMVoiceCapture</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.voicemax.app</string>
+	<string>com.artempolansky.wam-voice-capture</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>VoiceMax</string>
+	<string>WAMVoiceCapture</string>
+	<key>CFBundleDisplayName</key>
+	<string>WAM Voice Capture</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.1.0-dev</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>13.0</string>
+	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2025</string>
+	<string>Copyright © 2026 Artem Polansky. MIT License.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
@@ -32,10 +34,12 @@
 	<key>NSUserNotificationsUsageDescription</key>
 	<string>Show errors on capture or delivery failure.</string>
 	<key>NSAccessibilityUsageDescription</key>
-	<string>VoiceMax needs Accessibility to detect the fn key globally for voice capture start/stop.</string>
+	<string>WAM Voice Capture needs Accessibility to detect the global hotkey for voice capture start/stop.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>VoiceMax captures microphone audio for speech-to-text transcription.</string>
+	<string>WAM Voice Capture records microphone audio for speech-to-text transcription.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Meeting recording captures system audio so other participants on calls are transcribed alongside your voice.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Read calendar events to auto-name meeting transcripts and show today's events in the menu.</string>
 </dict>
 </plist>

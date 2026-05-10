@@ -1,5 +1,7 @@
 # Building TDLib for macOS
 
+> **Note:** TDLib is being phased out in [Phase 7](https://github.com/artempolansky/wam-voice-capture/issues/8) in favor of the simpler Telegram Bot API (HTTP, no native library). This document is preserved for users who still need the legacy userbot path.
+
 TDLib is the Telegram Database Library — official C++ client used by Telegram's own desktop apps. We use it for userbot login, forum topic enumeration, and message delivery.
 
 ## Prerequisites
@@ -25,7 +27,7 @@ cmake --build . --target install --parallel
 
 Result: `~/src/td/tdlib/` contains `include/`, `lib/libtdjson.dylib`.
 
-## Integration in VoiceMax
+## Integration in WAM Voice Capture
 
 Link flags in `scripts/build-app.sh`:
 
@@ -35,7 +37,7 @@ Link flags in `scripts/build-app.sh`:
 -ltdjson
 ```
 
-Copy `libtdjson.dylib` into `VoiceMax.app/Contents/Frameworks/` at build time.
+Copy `libtdjson.dylib` into `WAM Voice Capture.app/Contents/Frameworks/` at build time.
 
 ## Swift bridging
 
@@ -55,14 +57,14 @@ Register a Telegram API app at https://my.telegram.org/apps. Get `api_id` and `a
 enum TelegramAPI {
     static let apiID = <int>
     static let apiHash = "<hash>"
-    static let appVersion = "VoiceMax 1.0"
+    static let appVersion = "WAM Voice Capture 1.0"
 }
 ```
 
 ## Database location
 
 ```
-~/Library/Application Support/VoiceMax/tdlib/
+~/Library/Application Support/WAM Voice Capture/tdlib/
 ├── db.sqlite
 ├── td.binlog
 └── files/

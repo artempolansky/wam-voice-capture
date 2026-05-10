@@ -24,16 +24,18 @@ jobs:
 
       - name: Verify bundle
         run: |
-          # Until Phase 1 rename, the binary is still named VoiceMax
-          test -d VoiceMax.app
-          test -x VoiceMax.app/Contents/MacOS/VoiceMax
-          test -f VoiceMax.app/Contents/Info.plist
+          test -d "WAM Voice Capture.app"
+          test -x "WAM Voice Capture.app/Contents/MacOS/WAMVoiceCapture"
+          test -f "WAM Voice Capture.app/Contents/Info.plist"
+          # Sanity-check Info.plist has the new identifier and 14.0+ deployment.
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier"   "WAM Voice Capture.app/Contents/Info.plist" | grep -q '^com\.artempolansky\.wam-voice-capture$'
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "WAM Voice Capture.app/Contents/Info.plist" | grep -q '^14\.'
           echo "Bundle contents:"
-          ls -la VoiceMax.app/Contents/
+          ls -la "WAM Voice Capture.app/Contents/"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: app-bundle
-          path: VoiceMax.app
+          name: WAM-Voice-Capture-app
+          path: "WAM Voice Capture.app"
           retention-days: 14
