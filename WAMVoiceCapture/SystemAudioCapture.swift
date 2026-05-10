@@ -18,7 +18,7 @@ final class SystemAudioCapture: NSObject {
     var onAudioChunk: ((Data) -> Void)?
     var onError: ((Error) -> Void)?
 
-    private let outputQueue = DispatchQueue(label: "voicemax.systemaudio.output")
+    private let outputQueue = DispatchQueue(label: "wam-voice-capture.systemaudio.output")
     private var stream: SCStream?
     private var converter: AVAudioConverter?
     private var pendingBytes = Data()

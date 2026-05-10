@@ -42,11 +42,11 @@ final class TelegramClient {
 
     private let databaseDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("VoiceMax/tdlib", isDirectory: true)
+        return base.appendingPathComponent("WAM Voice Capture/tdlib", isDirectory: true)
     }()
     private let filesDir: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("VoiceMax/tdlib-files", isDirectory: true)
+        return base.appendingPathComponent("WAM Voice Capture/tdlib-files", isDirectory: true)
     }()
 
     // MARK: - Startup
@@ -124,7 +124,7 @@ final class TelegramClient {
                 }
             }
         }
-        t.name = "VoiceMax.TDLib.Receive"
+        t.name = "WAMVoiceCapture.TDLib.Receive"
         t.qualityOfService = .utility
         t.start()
         receiveThread = t

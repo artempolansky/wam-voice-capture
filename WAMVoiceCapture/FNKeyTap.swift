@@ -78,7 +78,7 @@ final class FNKeyTap {
             callback: fnFlagsChangedCallback,
             userInfo: nil
         ) else {
-            TrayLog.append("FN: CGEvent.tapCreate failed — System Settings → Privacy → Accessibility & Input Monitoring → VoiceMax")
+            TrayLog.append("FN: CGEvent.tapCreate failed — System Settings → Privacy → Accessibility & Input Monitoring → WAM Voice Capture")
             return false
         }
 

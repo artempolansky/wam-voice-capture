@@ -349,7 +349,7 @@ final class MeetingSession {
 
     private func makeTranscriptURL() throws -> URL {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("VoiceMax-Recordings", isDirectory: true)
+        let dir = docs.appendingPathComponent("WAM Voice Capture Recordings", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd-HHmm"

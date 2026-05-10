@@ -8,7 +8,7 @@ final class StatusBarController: NSObject {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
     /// CoreAudio deviceUID выбранного input устройства. Пусто / nil = system default.
-    private static let micDeviceUIDKey = "VoiceMaxMicDeviceUID"
+    private static let micDeviceUIDKey = "WAMMicDeviceUID"
 
     private var trayState = TrayState()
     /// FN-press: capture idempotency. FN-down кидает start, FN-up на том же нажатии — stop.
@@ -320,7 +320,7 @@ final class StatusBarController: NSObject {
 
     @objc private func openRecordingsFolder() {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("VoiceMax-Recordings", isDirectory: true)
+        let dir = docs.appendingPathComponent("WAM Voice Capture Recordings", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
     }
@@ -413,7 +413,7 @@ final class StatusBarController: NSObject {
         #if TELEGRAM_BUILD
         let alert = NSAlert()
         alert.messageText = "Telegram app credentials"
-        alert.informativeText = "Получить на my.telegram.org → API Development Tools. Сохранятся в login Keychain (voicemax.telegram.api_id / api_hash)."
+        alert.informativeText = "Получить на my.telegram.org → API Development Tools. Сохранятся в login Keychain (wam-voice-capture.telegram.api_id / api_hash)."
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 60))
         let idField = NSTextField(frame: NSRect(x: 0, y: 32, width: 360, height: 22))
         idField.placeholderString = "api_id (integer)"
@@ -552,7 +552,7 @@ final class StatusBarController: NSObject {
                 }
             }
             if fnMonitor == nil {
-                TrayLog.append("FN: NSEvent global monitor also nil — grant Accessibility for VoiceMax")
+                TrayLog.append("FN: NSEvent global monitor also nil — grant Accessibility for WAM Voice Capture")
             } else {
                 TrayLog.append("FN: NSEvent fallback — both edges via .function")
             }
@@ -799,7 +799,7 @@ final class StatusBarController: NSObject {
     @objc private func configureDeepgramKey() {
         let alert = NSAlert()
         alert.messageText = "Deepgram API key"
-        alert.informativeText = "Сохранится в login Keychain (service voicemax.deepgram.api_key, account deepgram)."
+        alert.informativeText = "Сохранится в login Keychain (service wam-voice-capture.deepgram.api_key, account deepgram)."
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
         field.placeholderString = isDeepgramKeyPresent() ? "•••••••• (уже сохранён — введи новый, чтобы перезаписать)" : "сюда вставь ключ"
         alert.accessoryView = field

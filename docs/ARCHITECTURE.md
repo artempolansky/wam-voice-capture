@@ -1,5 +1,9 @@
 # Architecture
 
+> **Note:** this document describes the **inherited VoiceMax 1.0.0 architecture**.
+> For the target architecture and phased plan toward WAM Voice Capture v1.x,
+> see [SPEC.md](SPEC.md). Patterns marked *(legacy)* are being replaced.
+
 ## Goals
 
 1. Use from any macOS device the owner logs into
@@ -17,17 +21,19 @@
 
 `DeepgramClient.swift` — WebSocket client to `wss://api.deepgram.com/v1/listen`. Parameters: `model=nova-3`, `language=ru`, `encoding=linear16`, `sample_rate=16000`, `interim_results=true`. Streams PCM chunks, emits partial and final transcripts via callbacks.
 
-API key stored in Keychain (`voicemax.deepgram.api_key`, account `deepgram`). Migrates transparently from the legacy `openclaw.deepgram.api_key` on first read.
+API key stored in Keychain (`wam-voice-capture.deepgram.api_key`, account `deepgram`). Migrates transparently from VoiceMax 1.0.0 (`voicemax.deepgram.api_key`) and the older OpenClaw fork (`openclaw.deepgram.api_key`) on first read.
 
-### Telegram (`Sources/Telegram/`)
+### Telegram (`Sources/Telegram/`) *(legacy — being replaced in Phase 7)*
 
-`TDLibClient.swift` — Swift wrapper around TDLib (Telegram's official C++ library). Handles:
+`TelegramClient.swift` — Swift wrapper around TDLib (Telegram's official C++ library). Handles:
 
 - **Login flow** — phone number, SMS code, 2FA password
 - **Forum topics** — `getForumTopics` for the configured group, filters closed topics
 - **Delivery** — `sendMessage` with `message_thread_id` set to topic ID
 
-TDLib database (encrypted SQLite) lives at `~/Library/Application Support/VoiceMax/tdlib/`. Database encryption key is generated on first login, stored in Keychain sealed to hardware UUID.
+TDLib database (encrypted SQLite) lives at `~/Library/Application Support/WAM Voice Capture/tdlib/`. Database encryption key is generated on first login and stored in Keychain (`wam-voice-capture.tdlib_db_key`, account `tdlib`).
+
+[Phase 7](https://github.com/artempolansky/wam-voice-capture/issues/8) replaces TDLib with the simpler Telegram Bot API (HTTP, no native library, no user OAuth — bot token from `@BotFather`).
 
 ### Crypto (`Sources/Crypto/`)
 
@@ -45,34 +51,25 @@ let uuid = IORegistryEntryCreateCFProperty(
 
 The UUID is fed through HKDF with a static salt to produce the TDLib database key. Key itself is stored in Keychain (`com.voicemax.tdlib.dbkey`, access `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`). If the keychain entry is copied to another Mac, the UUID-derived seed differs, and key derivation yields a different result — TDLib database fails to decrypt, user must re-authenticate.
 
-### UI (`Sources/UI/`)
+### UI
 
-Ported from VoiceMax Mini:
-
-- `StatusBarController.swift` — tray icon, FN-key capture trigger, capture state management
-- `RadialPickerPanel.swift` — middle-mouse radial route picker
-- `RouteFavoritesPanel.swift` — per-user route favorites config
-- `LoginView.swift` (new) — phone/code/password prompts on first run
-- `SettingsPanel.swift` (new) — Deepgram key, group ID, mic device selection
+- `StatusBarController.swift` — tray icon, hotkey capture trigger, capture state management
+- `Migration.swift` — one-shot legacy-layout migration from VoiceMax 1.0.0 (UserDefaults + Application Support directory)
 
 ## Data flow (recording → delivery)
 
 ```
-FN press
+Hotkey press
   → StatusBarController.doStart()
   → AudioCapture.start(device: selectedMic)
       emits 20ms PCM chunks
   → DeepgramClient.send(audioData: chunk)
       receives partial transcripts (shown in tray tooltip)
-FN press again
+Hotkey press again
   → AudioCapture.stop()
   → DeepgramClient.disconnect()
       returns final transcript
-  → TDLibClient.sendMessage(
-        chatId: personalGroupID,
-        threadId: selectedTopicID,
-        text: finalTranscript
-    )
+  → [target delivery, e.g. paste into focused window]
   → Tray returns to idle
 ```
 
@@ -80,27 +77,29 @@ No HTTP server, no intermediate storage, no external state. Failure at any step 
 
 ## Configuration
 
-Persisted in `UserDefaults.standard`:
+Persisted in `UserDefaults.standard` (post-rename keys; `Migration.swift` copies from legacy `VoiceMax*` keys on first launch):
 
-- `VoiceMaxSelectedRoute` — last selected topic ID
-- `VoiceMaxFavoriteRoutes` — pinned topics for radial picker
-- `VoiceMaxRouteTitles` — custom display labels
-- `VoiceMaxMicDevice` — preferred input device name
-- `VoiceMaxGroupID` — Telegram group ID (default: owner's personal forum group)
+- `WAMSelectedRoute` — last selected topic ID
+- `WAMFavoriteRoutes` — pinned topics
+- `WAMRouteTitles` — custom display labels
+- `WAMMicDeviceUID` — preferred input device UID (CoreAudio)
+- `WAMGroupID` — Telegram group ID
+- `WAMLightHost` / `WAMLightPort` / `WAMLightEnabled` — Matter Lamp config
 
-Keychain:
+Keychain (post-rename services; legacy `voicemax.*` and `openclaw.*` migrated on first read):
 
-- `voicemax.deepgram.api_key` — Deepgram API key
-- `voicemax.tdlib_db_key` — TDLib DB encryption key (sealed to HW UUID)
+- `wam-voice-capture.deepgram.api_key` — Deepgram API key
+- `wam-voice-capture.tdlib_db_key` — TDLib DB encryption key
+- `wam-voice-capture.telegram.api_id` / `api_hash` — Telegram app credentials
 
 ## Future: iOS
 
-All layers except FN-key/radial-picker are platform-agnostic:
+All layers except hotkey/radial-picker are platform-agnostic:
 
 - `Audio/` — `AVAudioEngine` works identically on iOS (with `AVAudioSession` setup)
 - `STT/` — `URLSessionWebSocketTask` is cross-platform
-- `Telegram/` — TDLib is mobile-first
+- `Telegram/` — TDLib is mobile-first; Bot API (Phase 7) is plain HTTP, even simpler
 - `Crypto/` — iOS has its own secure enclave; adapter pattern swaps IOKit for `DeviceCheck`
 - `UI/` — replaced with UIKit/SwiftUI screens; capture trigger becomes a hold-to-record button
 
-Estimated iOS port: 2–3 days once macOS version is stable.
+Out of scope for v1 per [SPEC.md](SPEC.md#5-out-of-scope-v1).

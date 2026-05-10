@@ -30,9 +30,9 @@ final class LightControl {
     }
 
     private struct Keys {
-        static let host    = "VoiceMaxLightHost"
-        static let port    = "VoiceMaxLightPort"
-        static let enabled = "VoiceMaxLightEnabled"
+        static let host    = "WAMLightHost"
+        static let port    = "WAMLightPort"
+        static let enabled = "WAMLightEnabled"
     }
 
     /// Empty by default — lamp integration is opt-in, configured via the

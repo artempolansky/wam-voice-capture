@@ -3,18 +3,18 @@ import Foundation
 import OSLog
 
 enum TrayLog {
-    static let logger = Logger(subsystem: "com.voicemax.app", category: "tray")
+    static let logger = Logger(subsystem: "com.artempolansky.wam-voice-capture", category: "tray")
 
     /// Plain-text log the user can read without Console.app (Application Support is reliable for GUI apps).
     static func append(_ line: String) {
         logger.info("\(line, privacy: .public)")
-        fputs("VoiceMax: \(line)\n", stderr)
+        fputs("WAM: \(line)\n", stderr)
 
         guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return
         }
-        let dir = base.appendingPathComponent("VoiceMax", isDirectory: true)
-        let url = dir.appendingPathComponent("voicemax-tray.txt", isDirectory: false)
+        let dir = base.appendingPathComponent("WAM Voice Capture", isDirectory: true)
+        let url = dir.appendingPathComponent("wam-voice-capture-tray.txt", isDirectory: false)
         let payload = (line + "\n").data(using: .utf8) ?? Data()
         do {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

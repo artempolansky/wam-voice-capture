@@ -1,54 +1,64 @@
-VoiceMax 1.0.0 — Quick Start
-============================
+WAM Voice Capture — Quick Start
+================================
 
 Что это:
   Менюбар-приложение для macOS, которое:
-  - расшифровывает речь с микрофона по нажатию fn (push-to-talk)
+  - расшифровывает речь с микрофона по нажатию хоткея (push-to-talk)
   - записывает встречи: твой мик + системное аудио вместе, с
     разделением на [Me] / [Others], в Markdown-файл
 
 Требования:
-  - macOS 13 (Ventura) или новее
+  - macOS 14 (Sonoma) или новее (нужно для Apple AEC)
   - Xcode Command Line Tools (один раз):
       xcode-select --install
-  - Homebrew (опционально, нужен только для Telegram-фич):
+  - Homebrew (опционально, нужен только для legacy Telegram-фич):
       https://brew.sh
 
 Установка:
-  1. Распакуй этот архив куда хочешь, например в ~/voicemax/.
+  1. Распакуй этот архив куда хочешь, например в ~/wam-voice-capture/.
   2. Открой Terminal в этой папке и запусти:
        bash scripts/install.sh
-     Скрипт сам соберёт VoiceMax.app, скопирует в /Applications/
+     Скрипт сам соберёт "WAM Voice Capture.app", скопирует в /Applications/
      и запустит. Первая сборка занимает 1-2 минуты.
 
   3. macOS попросит разрешения по очереди:
      - Микрофон — обязательно
-     - Accessibility (для глобальной fn-клавиши) — обязательно
+     - Accessibility (для глобального хоткея) — обязательно
      - Screen Recording — нужно только для режима встреч
        (захват системного аудио)
+     - Calendar — для авто-именования транскриптов по событиям
 
   4. Открой меню в трее (иконка справа в menu bar) и нажми
      "Deepgram API key…". Вставь свой ключ от Deepgram
      (получить: https://deepgram.com — есть бесплатный тариф).
 
 Использование:
-  - Push-to-talk диктовка: нажми fn, говори, нажми fn снова.
+  - Push-to-talk диктовка: нажми хоткей, говори, нажми хоткей снова.
     Текст вставится в активное окно.
 
   - Запись встречи: в меню → "Start meeting".
-    Файл появится в ~/Documents/VoiceMax-Recordings/.
+    Файл появится в ~/Documents/WAM Voice Capture Recordings/.
     По умолчанию пишутся только собеседники из колонок/наушников.
-    Чтобы твоя речь попала в транскрипт — зажми fn пока говоришь.
+    Чтобы твоя речь попала в транскрипт — зажми хоткей пока говоришь.
+    (В Phase 4 поведение меняется: оба канала пишутся всегда,
+     спикеры — Speaker 1 (ты) / Speaker 2 / Speaker 3 ...)
 
   - Просмотр транскрипта в реальном времени:
-      tail -f "$(ls -t ~/Documents/VoiceMax-Recordings/*.md | head -1)"
+      tail -f "$(ls -t ~/Documents/WAM\ Voice\ Capture\ Recordings/*.md | head -1)"
+
+Миграция с VoiceMax 1.0.0:
+  Если у тебя стояла VoiceMax 1.0.0 — новая сборка автоматически перенесёт:
+  - ключ Deepgram из Keychain
+  - данные ~/Library/Application Support/VoiceMax/ → WAM Voice Capture/
+  - настройки UserDefaults
+  Старые записи в ~/Documents/VoiceMax-Recordings/ остаются на месте.
 
 Логи и диагностика:
-    tail -f ~/Library/Application\ Support/VoiceMax/voicemax-tray.txt
+    tail -f ~/Library/Application\ Support/WAM\ Voice\ Capture/wam-voice-capture-tray.txt
 
 Удалить:
-    rm -rf /Applications/VoiceMax.app
-    rm -rf ~/Library/Application\ Support/VoiceMax
-    rm -rf ~/Documents/VoiceMax-Recordings
+    rm -rf "/Applications/WAM Voice Capture.app"
+    rm -rf ~/Library/Application\ Support/WAM\ Voice\ Capture
+    rm -rf ~/Documents/WAM\ Voice\ Capture\ Recordings
 
-Подробнее в README.md.
+Подробнее в README.md и docs/SPEC.md.

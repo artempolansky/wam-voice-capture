@@ -6,6 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var status: StatusBarController?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
+        // Run migration BEFORE first TrayLog.append — TrayLog writes into the
+        // post-migration directory. If we logged first, a fresh upgrade from
+        // VoiceMax 1.0.0 would end up with two App Support dirs.
+        Migration.runOnce()
         TrayLog.append("applicationWillFinishLaunching")
         NSApp.setActivationPolicy(.accessory)
     }
