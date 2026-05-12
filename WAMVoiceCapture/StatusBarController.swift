@@ -271,6 +271,25 @@ final class StatusBarController: NSObject {
                 open.target = self
                 menu.addItem(open)
             }
+
+            // Active speakers — one item per Speaker N (or custom name) with
+            // a Rename submenu. Empty until Deepgram emits at least one final
+            // result with words[].
+            let speakers = MeetingSession.shared.speakers.activeSpeakers()
+            if !speakers.isEmpty {
+                let renameRoot = NSMenuItem(title: "Rename speaker", action: nil, keyEquivalent: "")
+                let sub = NSMenu()
+                for s in speakers {
+                    let item = NSMenuItem(title: s.label,
+                                          action: #selector(renameSpeakerClicked(_:)),
+                                          keyEquivalent: "")
+                    item.target = self
+                    item.representedObject = s.id
+                    sub.addItem(item)
+                }
+                renameRoot.submenu = sub
+                menu.addItem(renameRoot)
+            }
         } else {
             let start = NSMenuItem(title: "Start meeting",
                                    action: #selector(startMeeting),
@@ -316,6 +335,24 @@ final class StatusBarController: NSObject {
     @objc private func openMeetingTranscript() {
         guard let url = MeetingSession.shared.transcriptURL else { return }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc private func renameSpeakerClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        let alert = NSAlert()
+        alert.messageText = "Rename \(sender.title)"
+        alert.informativeText = "New name applies to past and future lines in the transcript."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 24))
+        field.placeholderString = "e.g. Anya"
+        alert.accessoryView = field
+        let r = alert.runModal()
+        guard r == .alertFirstButtonReturn else { return }
+        let newName = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !newName.isEmpty else { return }
+        _ = MeetingSession.shared.renameSpeaker(id, to: newName)
     }
 
     @objc private func openRecordingsFolder() {
@@ -559,14 +596,15 @@ final class StatusBarController: NSObject {
         }
     }
 
-    /// FN-down. During a meeting this is a "push-to-record-me" trigger that
-    /// flips MeetingSession's [Me] channel ON. Outside a meeting it's the
-    /// classic toggle: start session if idle, stop if already recording.
+    /// FN-down. Toggle dictation: start session if idle, stop if already
+    /// recording. During a meeting FN is intentionally a no-op — meetings
+    /// always record both channels (Phase 4 spec FR-M2), so push-to-record-me
+    /// has no purpose.
     private func handleFNPress() async {
-        // During a meeting, FN is a hold gate for the [Me] channel — no
-        // debounce, both edges matter, no toggle dance.
         if MeetingSession.shared.isRunning {
-            MeetingSession.shared.setMeCapture(true)
+            // Meetings record continuously — FN does nothing during one to
+            // avoid accidentally starting a parallel dictation that would
+            // fight for the mic engine.
             return
         }
 
@@ -589,12 +627,10 @@ final class StatusBarController: NSObject {
         }
     }
 
-    /// FN-up. Only meaningful during a meeting (closes the [Me] gate).
-    /// In FN-dictation mode the toggle is on rising-edge only.
+    /// FN-up. No-op now; kept so the FN-tap subscriber API stays uniform with
+    /// `handleFNPress`. Push-to-record-me semantics were removed in Phase 4.
     private func handleFNRelease() {
-        if MeetingSession.shared.isRunning {
-            MeetingSession.shared.setMeCapture(false)
-        }
+        // Intentionally empty.
     }
 
     // MARK: - Local capture (Deepgram → paste)

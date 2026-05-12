@@ -255,6 +255,19 @@ final class AudioCapture {
         }
 
         let input = engine.inputNode
+
+        // Apple AEC (`setVoiceProcessingEnabled(true)`) is intentionally NOT
+        // enabled here. On this Mac it caused every mic candidate to report
+        // sampleRate=0/channels=0 once VP was set on the input node — the
+        // AudioCapture engine ended up in a broken state and `cycleToFirst-
+        // WorkingDevice` exhausted all candidates with "No audio input
+        // device available". Tracked for follow-up: AEC needs per-device-
+        // type gating (built-in mic OK, aggregates fail) and probably a
+        // dedicated engine instance for the meeting path. For now we ship
+        // Phase 4 without AEC; on speakers the user may see Speaker N's
+        // voice echoing into Speaker 1's channel — Deepgram's diarization
+        // usually still attributes the bulk correctly.
+
         let inputFormat = input.inputFormat(forBus: 0)
         TrayLog.append("audio: inputFormat sampleRate=\(inputFormat.sampleRate) channels=\(inputFormat.channelCount)")
         guard inputFormat.sampleRate > 0 else {

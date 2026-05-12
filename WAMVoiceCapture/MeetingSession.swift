@@ -5,10 +5,16 @@ import ScreenCaptureKit
 /// push-to-talk) — designed for 30 min – 2 hour sessions with auto-reconnect
 /// to Deepgram and live-append to a markdown transcript file.
 ///
-/// Audio routing: mic → channel 0 (Me), system audio → channel 1 (Others).
-/// Interleaved 16 kHz Int16 stereo PCM is streamed to Deepgram with
-/// `multichannel=true` so each Result carries a `channel_index` and the
-/// transcript can label the speaker side.
+/// Audio routing: mic → channel 0 (Speaker 1, always you), system audio →
+/// channel 1 (Speaker 2, 3, ... via diarization). Interleaved 16 kHz Int16
+/// stereo PCM is streamed to Deepgram with `multichannel=true` AND
+/// `diarize=true`. Per-result `words[]` carry per-word speaker IDs which we
+/// group into segments so multi-speaker results emit multiple lines.
+///
+/// Apple AEC (`voiceProcessingEnabled` on `AVAudioEngine.inputNode`) is
+/// enabled at the AudioCapture layer to suppress speaker bleed-through into
+/// the mic channel when the user is on speakers — that way Speaker 2's voice
+/// played through the laptop speakers doesn't echo into Speaker 1's channel.
 @MainActor
 final class MeetingSession {
 
@@ -41,10 +47,10 @@ final class MeetingSession {
     private var subscription: AudioCapture.SubscriptionID?
     private var systemCapture: AnyObject? // SystemAudioCapture, weak-typed to avoid availability guard at property level
 
-    /// When `false`, mic chunks are dropped before they reach the mixer —
-    /// channel 0 stays silent and Deepgram emits no `[Me]` transcripts.
-    /// Toggled via `setMeCapture(_:)` from the FN-key handler during a meeting.
-    private var meCaptureActive: Bool = false
+    /// Speaker labels for the active session. Mic is always Speaker 1; system
+    /// audio speakers are numbered Speaker 2, 3, ... in order of appearance.
+    /// User-visible labels are mutable via `renameSpeaker(_:to:)`.
+    let speakers = SpeakerLabels()
 
     // Per-channel ring buffers for mic + system. Each holds 16 kHz Int16
     // mono samples; we pop 320 frames from each every 20 ms and interleave
@@ -95,6 +101,7 @@ final class MeetingSession {
         stoppingDeliberately = false
         reconnectAttempt = 0
         clearMixerBuffers()
+        speakers.reset()
 
         attachMic()
         connectDeepgram()
@@ -146,37 +153,15 @@ final class MeetingSession {
 
     private func attachMic() {
         if let sub = subscription { AudioCapture.shared.unsubscribe(sub) }
+        // Mic is recorded continuously into channel 0 (Speaker 1). The
+        // FN-hold gate from VoiceMax 1.0.0 is gone — Apple AEC suppresses
+        // speaker bleed-through, so we don't need to choke the mic to avoid
+        // echo when the user is on laptop speakers.
         subscription = AudioCapture.shared.subscribe { [weak self] chunk in
             guard let self else { return }
             self.mixerLock.lock()
-            // FN gates whether mic audio enters the [Me] channel. While the
-            // user isn't holding FN, drop the chunk so channel 0 stays silent.
-            if self.meCaptureActive {
-                self.micQueue.append(chunk)
-            }
+            self.micQueue.append(chunk)
             self.mixerLock.unlock()
-        }
-    }
-
-    /// Push-to-record-me: called from the FN handler during a meeting.
-    /// On rising edge we prepend the AudioCapture pre-roll snapshot so the
-    /// first 1.5 s of the user's utterance (often spoken just before they
-    /// reach for FN) lands in `[Me]`.
-    func setMeCapture(_ active: Bool) {
-        guard isRunning else { return }
-        guard active != meCaptureActive else { return }
-        if active {
-            let preRoll = AudioCapture.shared.preRollSnapshot()
-            mixerLock.lock()
-            if !preRoll.isEmpty { micQueue.append(preRoll) }
-            meCaptureActive = true
-            mixerLock.unlock()
-            TrayLog.append("meeting: [Me] capture ON (FN held)")
-        } else {
-            mixerLock.lock()
-            meCaptureActive = false
-            mixerLock.unlock()
-            TrayLog.append("meeting: [Me] capture OFF (FN released)")
         }
     }
 
@@ -285,7 +270,8 @@ final class MeetingSession {
         let dg = DeepgramClient(
             apiKey: apiKey,
             channels: 2,
-            multichannel: true
+            multichannel: true,
+            diarize: true
         )
         dg.onOpen = { [weak self] in
             Task { @MainActor [weak self] in
@@ -308,14 +294,47 @@ final class MeetingSession {
 
     private func handleTranscript(_ t: DeepgramClient.Transcript) {
         guard t.isFinal else { return }
-        let trimmed = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let label: String
-        switch t.channelIndex {
-        case 0: label = "Me"
-        case 1: label = "Others"
-        default: label = ""
+        let channel = t.channelIndex ?? 0
+
+        // No words[] → either diarization is off or this final has no words.
+        // Fallback: emit one line with the full transcript labelled by channel.
+        guard !t.words.isEmpty else {
+            let trimmed = t.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            let id = speakers.internalID(channel: channel, dgSpeaker: nil)
+            appendSegment(text: trimmed, speakerID: id)
+            return
         }
+
+        // Group consecutive words by speaker so a multi-speaker result emits
+        // one line per speaker rather than collapsing to a single label.
+        var segmentText = ""
+        var segmentSpeaker: Int?
+        var first = true
+
+        for word in t.words {
+            if first || word.speaker == segmentSpeaker {
+                if !segmentText.isEmpty { segmentText += " " }
+                segmentText += word.text
+                segmentSpeaker = word.speaker
+                first = false
+            } else {
+                let id = speakers.internalID(channel: channel, dgSpeaker: segmentSpeaker)
+                appendSegment(text: segmentText, speakerID: id)
+                segmentText = word.text
+                segmentSpeaker = word.speaker
+            }
+        }
+        if !segmentText.isEmpty {
+            let id = speakers.internalID(channel: channel, dgSpeaker: segmentSpeaker)
+            appendSegment(text: segmentText, speakerID: id)
+        }
+    }
+
+    private func appendSegment(text: String, speakerID: SpeakerLabels.InternalID) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let label = speakers.displayName(for: speakerID)
         appendLine(trimmed, label: label)
     }
 
@@ -369,12 +388,14 @@ final class MeetingSession {
         guard let handle = fileHandle else { return }
         let timestamp: String = {
             let fmt = DateFormatter()
-            fmt.dateFormat = "HH:mm:ss"
+            fmt.dateFormat = "HH:mm"
             return fmt.string(from: Date())
         }()
+        // Format per spec FR-M5: "HH:MM Speaker N: text" or "HH:MM <name>: text".
+        // No brackets — keeps the file readable when piped through `tail -f`.
         let line = label.isEmpty
-            ? "[\(timestamp)] \(text)\n"
-            : "[\(timestamp)] [\(label)] \(text)\n"
+            ? "\(timestamp) \(text)\n"
+            : "\(timestamp) \(label): \(text)\n"
         if let data = line.data(using: .utf8) {
             do {
                 try handle.write(contentsOf: data)
@@ -382,6 +403,73 @@ final class MeetingSession {
             } catch {
                 TrayLog.append("meeting: write failed — \(error.localizedDescription)")
             }
+        }
+    }
+
+    // MARK: - Speaker rename (live)
+
+    /// Rename a speaker. Updates the tray label and rewrites the transcript
+    /// file in place: every line currently labelled `<oldLabel>:` becomes
+    /// `<newLabel>:`. Subsequent lines from this speaker also use the new
+    /// label.
+    ///
+    /// Returns true on success, false if the rename was a no-op (empty name,
+    /// unchanged, or speaker unknown).
+    @discardableResult
+    func renameSpeaker(_ id: SpeakerLabels.InternalID, to newName: String) -> Bool {
+        guard let change = speakers.rename(id, to: newName) else { return false }
+        rewriteFileLabel(from: change.oldLabel, to: change.newLabel)
+        TrayLog.append("meeting: rename \(change.oldLabel) → \(change.newLabel)")
+        return true
+    }
+
+    /// Replace `<oldLabel>:` with `<newLabel>:` on every line of the
+    /// transcript file. Naïve full-file rewrite; meetings produce kilobytes
+    /// of text per minute so this is cheap. Done in place — we close the
+    /// append handle, rewrite, then reopen for append at EOF.
+    private func rewriteFileLabel(from oldLabel: String, to newLabel: String) {
+        guard let url = transcriptURL else { return }
+        // Flush any in-flight write, then drop the handle so we have an
+        // exclusive view of the file content.
+        try? fileHandle?.synchronize()
+        try? fileHandle?.close()
+        fileHandle = nil
+
+        do {
+            var content = try String(contentsOf: url, encoding: .utf8)
+            // Per-line replacement: split on newline, rewrite leading
+            // "HH:MM <oldLabel>: " to "HH:MM <newLabel>: ". This pattern is
+            // anchored on the timestamp so it can't false-match label-like
+            // text inside transcripts.
+            let lines = content.split(separator: "\n", omittingEmptySubsequences: false)
+            var rewritten: [String] = []
+            rewritten.reserveCapacity(lines.count)
+            let oldPrefix = " \(oldLabel): "
+            let newPrefix = " \(newLabel): "
+            for line in lines {
+                let s = String(line)
+                if let range = s.range(of: oldPrefix),
+                   range.lowerBound == s.index(s.startIndex, offsetBy: 5, limitedBy: s.endIndex) {
+                    // Char positions 0-4 = "HH:MM"; range.lowerBound at offset 5 means
+                    // " Speaker N: " starts right after the timestamp.
+                    rewritten.append(s.replacingCharacters(in: range, with: newPrefix))
+                } else {
+                    rewritten.append(s)
+                }
+            }
+            content = rewritten.joined(separator: "\n")
+            try content.write(to: url, atomically: true, encoding: .utf8)
+        } catch {
+            TrayLog.append("meeting: rewrite failed — \(error.localizedDescription)")
+        }
+
+        // Reopen for append at EOF for subsequent writes.
+        do {
+            let h = try FileHandle(forWritingTo: url)
+            try h.seekToEnd()
+            fileHandle = h
+        } catch {
+            TrayLog.append("meeting: failed to reopen handle after rewrite — \(error.localizedDescription)")
         }
     }
 

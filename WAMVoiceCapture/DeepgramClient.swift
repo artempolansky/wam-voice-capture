@@ -15,11 +15,25 @@ import Foundation
 /// 200–500 ms and previously dropped any audio that landed in that window.
 final class DeepgramClient: NSObject {
 
+    /// One word from Deepgram's `alternatives[0].words[]` array. Populated only
+    /// when `diarize=true` is enabled. `speaker` is Deepgram's session-local
+    /// speaker ID (0, 1, 2, ...) within the channel — meaningless across
+    /// sessions or channels.
+    struct Word {
+        let text: String
+        let speaker: Int?
+        let start: Double
+        let end: Double
+    }
+
     struct Transcript {
         let text: String
         let isFinal: Bool
         /// Channel-index from Deepgram when `multichannel=true`. nil for mono.
         let channelIndex: Int?
+        /// Per-word speaker assignments (when `diarize=true`). Empty if
+        /// diarization is off, or if this was an interim result with no words.
+        let words: [Word]
     }
 
     var onTranscript: ((Transcript) -> Void)?
@@ -32,6 +46,7 @@ final class DeepgramClient: NSObject {
     private let model: String
     private let channels: Int
     private let multichannel: Bool
+    private let diarize: Bool
 
     private enum State {
         case idle, connecting, open, closing, closed, failed
@@ -60,12 +75,14 @@ final class DeepgramClient: NSObject {
          language: String = "multi",
          model: String = "nova-3",
          channels: Int = 1,
-         multichannel: Bool = false) {
+         multichannel: Bool = false,
+         diarize: Bool = false) {
         self.apiKey = apiKey
         self.language = language
         self.model = model
         self.channels = channels
         self.multichannel = multichannel
+        self.diarize = diarize
         super.init()
     }
 
@@ -171,6 +188,9 @@ final class DeepgramClient: NSObject {
         if multichannel {
             items.append(URLQueryItem(name: "multichannel", value: "true"))
         }
+        if diarize {
+            items.append(URLQueryItem(name: "diarize", value: "true"))
+        }
         comps.queryItems = items
         return comps.url
     }
@@ -235,8 +255,28 @@ final class DeepgramClient: NSObject {
             if let arr = obj["channel_index"] as? [Int], let idx = arr.first {
                 channelIndex = idx
             }
+            // Parse per-word speaker assignments when diarize=true.
+            // Deepgram emits `words[]` only on final results — interims are
+            // safe to ignore here; we'll still emit interim Transcripts with
+            // empty words[] for any callers that watch them.
+            var words: [Word] = []
+            if let rawWords = first["words"] as? [[String: Any]] {
+                words.reserveCapacity(rawWords.count)
+                for w in rawWords {
+                    guard let wText = (w["punctuated_word"] as? String) ?? (w["word"] as? String) else {
+                        continue
+                    }
+                    let speaker = w["speaker"] as? Int
+                    let start = (w["start"] as? Double) ?? 0
+                    let end = (w["end"] as? Double) ?? 0
+                    words.append(Word(text: wText, speaker: speaker, start: start, end: end))
+                }
+            }
             if !text.isEmpty || isFinal {
-                onTranscript?(Transcript(text: text, isFinal: isFinal, channelIndex: channelIndex))
+                onTranscript?(Transcript(text: text,
+                                         isFinal: isFinal,
+                                         channelIndex: channelIndex,
+                                         words: words))
             }
         }
     }

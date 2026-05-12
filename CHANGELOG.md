@@ -8,7 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Phase 4: meetings always record both channels with per-speaker diarization (#5).
+  - mic → `Speaker 1` (always you), system audio → `Speaker 2`, `Speaker 3`, ... numbered in order of first appearance via Deepgram `diarize=true` + per-word speaker IDs.
+  - Tray menu during a meeting: **Rename speaker** submenu — renames apply retroactively to the whole transcript file (find/replace anchored on `HH:MM <label>: ` prefix) and to all subsequent lines.
+  - File format changed: `[HH:MM:SS] [Label] text` → `HH:MM Speaker N: text` (per spec FR-M5).
+  - `MeetingSession.setMeCapture` removed; FN no longer push-to-record-me during a meeting (FN now no-op while a meeting is running, since both channels are continuous).
+  - `DeepgramClient`: new `diarize` init param + `Word` struct in `Transcript` carrying per-word `speaker`, `start`, `end`.
+  - `SpeakerLabels`: new per-session registry mapping `(channel, dgSpeaker)` → stable internal ID, with rename API.
 - Phase 0: repo bootstrap — `.gitignore`, GitHub Actions CI (build), `CONTRIBUTING.md`, `CHANGELOG.md`, `docs/SPEC.md`.
+
+### Deferred
+- Apple AEC (`voiceProcessingEnabled`) — enabling it on this Mac left every mic candidate reporting `sampleRate=0.0/channels=0`. Needs per-device-type gating (built-in mic OK; aggregate / VPAU devices fail). Tracked separately. On laptop speakers without AEC, expect Speaker N's voice to bleed faintly into Speaker 1's channel; Deepgram's diarization usually still attributes the bulk correctly.
 - Phase 1: rename `VoiceMax` → `WAM Voice Capture` (#2).
   - Bundle id `com.artempolansky.wam-voice-capture`, display name `WAM Voice Capture`, executable `WAMVoiceCapture`.
   - Source dir `VoiceMax/` → `WAMVoiceCapture/`; main entry `WAMVoiceCaptureMain.swift`.

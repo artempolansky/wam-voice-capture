@@ -48,6 +48,7 @@ SWIFTC_ARGS=(
   "$ROOT/WAMVoiceCapture/KeychainHelper.swift"
   "$ROOT/WAMVoiceCapture/LocalCaptureSession.swift"
   "$ROOT/WAMVoiceCapture/MeetingSession.swift"
+  "$ROOT/WAMVoiceCapture/SpeakerLabels.swift"
   "$ROOT/WAMVoiceCapture/SystemAudioCapture.swift"
   "$ROOT/WAMVoiceCapture/LightControl.swift"
   "$ROOT/WAMVoiceCapture/TelegramClient.swift"
