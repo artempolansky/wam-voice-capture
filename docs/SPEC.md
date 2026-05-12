@@ -19,7 +19,7 @@
 | Monetization | Free, open source, optional donations | 2026-05-07 |
 | Support | GitHub Issues + Discussions | 2026-05-07 |
 | STT providers (v1) | Deepgram + OpenAI-compatible Whisper + Apple Speech | 2026-05-07 |
-| Delivery targets | Generic webhook + Telegram Bot API (HTTP, no TDLib) | 2026-05-07 |
+| Delivery targets | ~~Webhook + Telegram Bot~~ → **`AgentSyncTarget` (rsync over SSH to remote inbox)** + open `AGENT_PROTOCOL.md`. Tracked in [epic #17](https://github.com/artempolansky/wam-voice-capture/issues/17). | 2026-05-12 |
 | Personal Angelina preset | Local-only `personal_targets.json`, gitignored | 2026-05-07 |
 | Hotkey default | F5 (configurable via picker) | 2026-05-07 |
 | Mic engine | On-demand by default (no green menubar in idle); always-on as opt-in | 2026-05-07 |
@@ -80,31 +80,28 @@ Menu-bar macOS app that:
 - **FR-S3.** Any folder valid (iCloud Drive, Dropbox, etc.).
 - **FR-S4.** Reset to default option.
 
-### 2.5. Delivery (webhook / Telegram Bot)
+### 2.5. Delivery — agent sync targets (file-based, generic)
 
-- **FR-W1.** Tray menu **Send to ▸** lists configured delivery targets with on/off toggles. Multiple targets supported (e.g., webhook + Telegram bot fired in parallel).
-- **FR-W2.** Each target is one of:
-  - **Webhook** — URL + Bearer token (in Keychain)
-  - **Telegram Bot** — bot token (from @BotFather) + chat_id or @username + optional `message_thread_id`
-- **FR-W3.** Webhook payload (`POST <URL>`):
-  ```json
-  {
-    "title": "Event title or 'Dictation'",
-    "body": "<full markdown content>",
-    "timestamp": "2026-05-05T14:30:00Z",
-    "source": "WAM Voice Capture v1.x.x",
-    "type": "meeting" | "dictation",
-    "metadata": {
-      "duration_seconds": 1800,
-      "speakers": ["Speaker 1", "Anya", "Speaker 3"],
-      "calendar_event_id": "..."
-    }
-  }
-  ```
-- **FR-W4.** Telegram Bot delivery: `POST https://api.telegram.org/bot<TOKEN>/sendMessage` (or `sendDocument` for transcripts >4096 chars).
-- **FR-W5.** On network error: transcript stays local, tray shows "Last send failed: <error>" with Retry.
-- **FR-W6.** Per-target Test button sends a synthetic message.
-- **FR-W7.** Personal Angelina preset is local-only (`personal_targets.json`, gitignored). Public build ships zero presets.
+**Pivot 2026-05-12:** Earlier draft of this section described HTTP webhook + Telegram bot delivery. That was replaced by file-sync delivery — see [epic #17](https://github.com/artempolansky/wam-voice-capture/issues/17) for the full rationale. Key motivation: agents (Angelina or any other) need to *watch* the transcript as it grows, not receive it as a single POST at the end. Files in a remote folder are the lowest-common-denominator IPC for that.
+
+- **FR-W1.** Tray menu **Send to ▸** lists configured **AgentSyncTargets** with on/off toggles. Multiple targets supported, fired in parallel.
+- **FR-W2.** Each target is one SSH/rsync destination:
+  - Name (display only, e.g. "My Angelina", "Team archive")
+  - Host (e.g. `54.36.163.214`)
+  - User (e.g. `artem`)
+  - Remote inbox path (e.g. `/home/artem/angelina/inbox/`)
+  - SSH private-key path (default `~/.ssh/id_ed25519`)
+  - `includeDictations` toggle (default OFF — meetings sync, dictations are local-only by default)
+- **FR-W3.** Transport: system `/usr/bin/rsync` over SSH (`rsync -avz --partial --inplace -e ssh`). `--inplace` is required so the receiving agent sees a growing file rather than an atomic-renamed final file.
+- **FR-W4.** Lifecycle:
+  - On meeting start: file appears in target's inbox with header (rsync of empty/short file)
+  - Every ~2 s during the meeting (debounced FSEvents): incremental rsync sends the delta
+  - On meeting stop: final rsync, then `<basename>.done` empty marker file is written
+  - On dictation (only if `includeDictations` enabled): same flow but file path uses dictation naming
+- **FR-W5.** On network error: transcript stays local; tray shows "Last sync failed to <target>: <error>" with Retry. Mac keeps retrying with backoff while the meeting is active.
+- **FR-W6.** Per-target **Test** button sends a probe file (`probe-<timestamp>.txt`) + `.done` marker; tray reports success/failure.
+- **FR-W7.** Personal presets are local-only (`personal_targets.json`, gitignored). Public build ships zero targets — user adds their own.
+- **FR-W8.** Open protocol: target inbox layout and file format documented in `docs/AGENT_PROTOCOL.md` so any third-party agent can subscribe without reading Swift source.
 
 ### 2.6. STT providers
 
@@ -168,8 +165,8 @@ Menu-bar macOS app that:
 │  Bridges:                              │
 │  - HotkeyTap (CGEventTap, configurable)│
 │  - CalendarBridge (EventKit)           │
-│  - WebhookTarget (URLSession)          │
-│  - TelegramBotTarget (URLSession)      │
+│  - AgentSyncTarget (rsync over SSH)    │
+│  - AgentSyncRegistry (multi-target)    │
 │  - LightControl (Matter Lamp)          │
 │  - UpdateNotifier (GitHub Releases)    │
 ├────────────────────────────────────────┤
@@ -185,8 +182,8 @@ Menu-bar macOS app that:
 - `STTProvider.swift` (protocol)
 - `WhisperClient.swift`
 - `AppleSpeechClient.swift`
-- `WebhookTarget.swift`
-- `TelegramBotTarget.swift` (replaces TDLib-based `TelegramClient.swift`)
+- `AgentSyncTarget.swift` (rsync-over-SSH delivery, replaces planned WebhookTarget/TelegramBotTarget)
+- `AgentSyncRegistry.swift` (multi-target management + persistence)
 - `SpeakerLabels.swift`
 - `UpdateNotifier.swift`
 
@@ -225,7 +222,11 @@ Each phase = one issue + branch + PR. Phases are sequential; Milestones group th
 
 ### Milestone 2 — Delivery
 
-- **Phase 7** — Generic delivery: `DeliveryTarget` protocol, `WebhookTarget`, `TelegramBotTarget`. TDLib removed.
+- **Phase 7** — Agent sync delivery (epic [#17](https://github.com/artempolansky/wam-voice-capture/issues/17)):
+  - **Phase 7a** ([#18](https://github.com/artempolansky/wam-voice-capture/issues/18)): `AgentSyncTarget` + `AgentSyncRegistry` on Mac (rsync-over-SSH, tray UI, multi-target, `.done` marker)
+  - **Phase 7b** ([#19](https://github.com/artempolansky/wam-voice-capture/issues/19)): `docs/AGENT_PROTOCOL.md` — open protocol documentation
+  - Reference agent implementation lives in [`artempolansky/angelina-ops`](https://github.com/artempolansky/angelina-ops) — out of scope for this repo, tracked via [angelina-ops#263 (v2 cron)](https://github.com/artempolansky/angelina-ops/issues/263) and [#264 (v3 conversational)](https://github.com/artempolansky/angelina-ops/issues/264)
+  - TDLib still removed (was tied to the abandoned Telegram-bot delivery design)
 
 ### Milestone 3 — STT abstraction
 
@@ -289,11 +290,14 @@ Common gates for any release tag:
 - [ ] Change → iCloud Drive path → next recording lands there
 - [ ] Reset → default
 
-**Delivery (post Phase 7):**
-- [ ] Webhook target → end of dictation → POST received
-- [ ] Telegram Bot target → message in chat
-- [ ] Multiple targets fire in parallel
-- [ ] Network failure → "Last send failed" + Retry
+**Agent sync delivery (post Phase 7):**
+- [ ] Configured target appears in tray with status indicator
+- [ ] During a meeting, transcript file appears in remote inbox path and grows in near-real-time
+- [ ] On Stop meeting: `.done` marker appears in remote inbox within ~3 seconds
+- [ ] Multiple targets fire in parallel; one slow target doesn't block another
+- [ ] Network failure → "Last sync failed: <error>" + Retry; sync resumes when network returns
+- [ ] Test button on a target sends a probe file successfully
+- [ ] Dictation transcripts skip sync unless `includeDictations` toggle is on
 
 **STT (post Phase 8):**
 - [ ] Switching providers in tray works mid-session (with restart)

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Phase 7 redesigned: delivery is now file-sync (rsync over SSH) to a configurable remote `inbox/`, instead of HTTP webhook + Telegram Bot. Agent-agnostic — open protocol documented separately. Driving issue: [epic #17](https://github.com/artempolansky/wam-voice-capture/issues/17). Old [#8](https://github.com/artempolansky/wam-voice-capture/issues/8) closed.
+- `docs/SPEC.md` §0 decisions log + §2.5 + §4 architecture + §6 phases updated accordingly.
+
 ### Added
 - Phase 4: meetings always record both channels with per-speaker diarization (#5).
   - mic → `Speaker 1` (always you), system audio → `Speaker 2`, `Speaker 3`, ... numbered in order of first appearance via Deepgram `diarize=true` + per-word speaker IDs.
