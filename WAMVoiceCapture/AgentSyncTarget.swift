@@ -43,7 +43,9 @@ final class AgentSyncTarget {
 
     private let lock = NSLock()
     private var _status: Status = .idle
-    private var _inflight: Bool = false
+    /// Serial — all rsync/ssh invocations are queued here so two operations
+    /// to the same target never overlap, and completion handlers fire in
+    /// order without coalescing logic.
     private let runQueue: DispatchQueue
 
     init(id: String = UUID().uuidString,
@@ -70,9 +72,9 @@ final class AgentSyncTarget {
     }
 
     /// Run one rsync of `localFile` to the remote inbox. Idempotent; safe to
-    /// call repeatedly. Coalesces concurrent calls — if a sync is already in
-    /// flight, queues exactly one follow-up (so a burst of `noteUpdate` calls
-    /// collapses into "current run + one more").
+    /// call repeatedly. Serialized on the per-target `runQueue` — concurrent
+    /// calls queue up and run in order, so `completion` is always invoked
+    /// exactly once.
     ///
     /// `completion` is called on the run queue (background). Use `DispatchQueue.main.async`
     /// inside the closure if you need to touch UI / TrayLog.
@@ -81,22 +83,17 @@ final class AgentSyncTarget {
             completion?(.failure(SyncError.disabled))
             return
         }
-        lock.lock()
-        if _inflight {
-            lock.unlock()
-            // Drop — the in-flight run will pick up the latest file content
-            // anyway, since rsync sends the file as-it-is-now at each invocation.
-            // (Real coalescing would need a "pending follow-up" flag; for now
-            // this is fine because rsync is invoked by debounced timer too.)
-            return
-        }
-        _inflight = true
-        _status = .syncing
-        lock.unlock()
-
         runQueue.async { [weak self] in
-            guard let self else { return }
+            guard let self else {
+                completion?(.failure(SyncError.disabled))
+                return
+            }
+            self.lock.lock()
+            self._status = .syncing
+            self.lock.unlock()
+
             let result = self.runRsync(localFile: localFile)
+
             self.lock.lock()
             switch result {
             case .success:
@@ -104,7 +101,6 @@ final class AgentSyncTarget {
             case .failure(let err):
                 self._status = .lastFailed(at: Date(), error: err.localizedDescription)
             }
-            self._inflight = false
             self.lock.unlock()
             completion?(result)
         }
