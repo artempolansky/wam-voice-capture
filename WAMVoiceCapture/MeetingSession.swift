@@ -352,7 +352,11 @@ final class MeetingSession {
     }
 
     private func handleClose(code: Int, reason: String) {
-        TrayLog.append("meeting: deepgram WS closed (code=\(code))")
+        // Surface the close reason — Deepgram puts an explanation here for
+        // server-side closes (code 1011 etc), and silently dropping it has
+        // been hiding root causes when sockets die between meetings.
+        let reasonNote = reason.isEmpty ? "" : " — \(reason)"
+        TrayLog.append("meeting: deepgram WS closed (code=\(code))\(reasonNote)")
         guard isRunning, !stoppingDeliberately else { return }
         scheduleReconnect()
     }

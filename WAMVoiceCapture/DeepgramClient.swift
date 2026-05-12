@@ -100,7 +100,13 @@ final class DeepgramClient: NSObject {
         var req = URLRequest(url: url)
         req.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
 
-        let cfg = URLSessionConfiguration.default
+        // Ephemeral configuration: no shared HTTP/2 connection pool with other
+        // URLSessions in the process. Across multiple back-to-back meetings,
+        // `.default` was handing back stale sockets from the connection pool —
+        // new WebSocket tasks opened on a half-dead TCP, then died with
+        // "Socket is not connected" / WS code 1011. Ephemeral gives each
+        // DeepgramClient a clean transport stack.
+        let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 15
         cfg.waitsForConnectivity = false
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
