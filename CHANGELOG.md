@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Phase 7a: `AgentSyncTarget` + `AgentSyncRegistry` — generic rsync-over-SSH delivery of meeting transcripts to a configurable remote `inbox/`. ([#18](https://github.com/artempolansky/wam-voice-capture/issues/18))
+  - One or more sync targets per machine, each independently togglable
+  - Persistence: user-managed targets in `UserDefaults`; developer's private targets in gitignored `personal_targets.json` (loaded but never committed)
+  - Tray menu **Send to ▸** lists targets with last-sync status, per-target submenu (Enabled / Include dictations / Test / Edit / Remove), and **Add target…** with a 5-field dialog
+  - Lifecycle: on meeting start → initial rsync (header arrives); during meeting → debounced 2 s rsync on every `appendLine`; on stop → final rsync + `<basename>.done` empty marker file via SSH `touch`
+  - Speaker rename also triggers a sync so the agent sees the rewritten labels promptly
+  - `rsync -az --partial --inplace -e ssh` — `--inplace` is important so a remote watcher sees the file grow rather than racing an atomic rename
+  - **Test** button uploads a probe file + cleans up on remote — verifies reachability and write-permission
+
 ### Changed
 - Phase 7 redesigned: delivery is now file-sync (rsync over SSH) to a configurable remote `inbox/`, instead of HTTP webhook + Telegram Bot. Agent-agnostic — open protocol documented separately. Driving issue: [epic #17](https://github.com/artempolansky/wam-voice-capture/issues/17). Old [#8](https://github.com/artempolansky/wam-voice-capture/issues/8) closed.
 - `docs/SPEC.md` §0 decisions log + §2.5 + §4 architecture + §6 phases updated accordingly.

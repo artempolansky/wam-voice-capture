@@ -100,7 +100,13 @@ final class DeepgramClient: NSObject {
         var req = URLRequest(url: url)
         req.setValue("Token \(apiKey)", forHTTPHeaderField: "Authorization")
 
-        let cfg = URLSessionConfiguration.default
+        // Ephemeral configuration: no shared HTTP/2 connection pool with other
+        // URLSessions in the process. Across multiple back-to-back meetings,
+        // `.default` was handing back stale sockets from the connection pool —
+        // new WebSocket tasks opened on a half-dead TCP, then died with
+        // "Socket is not connected" / WS code 1011. Ephemeral gives each
+        // DeepgramClient a clean transport stack.
+        let cfg = URLSessionConfiguration.ephemeral
         cfg.timeoutIntervalForRequest = 15
         cfg.waitsForConnectivity = false
         let s = URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
@@ -122,9 +128,12 @@ final class DeepgramClient: NSObject {
             _chunksSent += 1
             _bytesSent  += pcm.count
             lock.unlock()
-            t.send(.data(pcm)) { [weak self] err in
-                if let err { self?.onError?(err) }
-            }
+            // Retry transient ENOTCONN: URLSessionWebSocketTask sometimes
+            // fires `didOpenWithProtocol` before the underlying BSD socket
+            // is actually writable. First sends fail with "Socket is not
+            // connected" (errno 57) on a cold socket — we retry up to twice
+            // after small delays before surfacing the error.
+            attemptSend(pcm: pcm, on: t, attempt: 0)
         case .connecting:
             // Buffer until handshake completes — but cap so a never-opening
             // socket can't grow memory unbounded.
@@ -136,6 +145,46 @@ final class DeepgramClient: NSObject {
         default:
             lock.unlock()
         }
+    }
+
+    private func attemptSend(pcm: Data, on task: URLSessionWebSocketTask, attempt: Int) {
+        task.send(.data(pcm)) { [weak self] err in
+            guard let self else { return }
+            guard let err else { return }
+            if attempt < 2 && Self.isRetryableSendError(err) {
+                // Re-check state — task may have been torn down between
+                // attempts. Capture the current task fresh so we don't write
+                // into a stale closed handle.
+                self.lock.lock()
+                let stillOpen = (self.state == .open)
+                let currentTask = self.task
+                self.lock.unlock()
+                guard stillOpen, let currentTask else { return }
+                let delay: TimeInterval = 0.2 * Double(attempt + 1)
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) { [weak self] in
+                    self?.attemptSend(pcm: pcm, on: currentTask, attempt: attempt + 1)
+                }
+                return
+            }
+            // Either we ran out of retries or the error isn't retryable.
+            // Surface to caller so the session-level reconnect logic kicks in.
+            self.onError?(err)
+        }
+    }
+
+    /// True if `err` matches the cold-socket race ("Socket is not connected").
+    /// Both NSPOSIX 57 and URL-layer wrappers around it are accepted.
+    private static func isRetryableSendError(_ err: Error) -> Bool {
+        let nsErr = err as NSError
+        if nsErr.domain == NSPOSIXErrorDomain && nsErr.code == 57 { return true }
+        if let underlying = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError,
+           underlying.domain == NSPOSIXErrorDomain && underlying.code == 57 {
+            return true
+        }
+        // Belt-and-braces: localized description match for cases where the
+        // error doesn't carry POSIX domain info (varies by macOS minor).
+        let desc = err.localizedDescription.lowercased()
+        return desc.contains("socket is not connected") || desc.contains("not connected")
     }
 
     /// Tell Deepgram we're done — server flushes pending finals then closes.
