@@ -2,6 +2,7 @@ import Foundation
 import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import CoreGraphics
 
 /// Captures system audio output via ScreenCaptureKit and converts it to
 /// 16 kHz mono Int16 PCM. Used by `MeetingSession` to merge a second channel
@@ -50,7 +51,15 @@ final class SystemAudioCapture: NSObject {
     }
 
     func start() async throws {
-        // SCShareableContent triggers the permission prompt the first time.
+        // Preflight: if Screen Recording isn't granted, bail out *without*
+        // triggering the system permission prompt. SCShareableContent would
+        // pop the prompt on every meeting start — annoying for users who've
+        // already declined or who only ever do mic-only meetings. The first
+        // user who actually wants system audio enables it via System Settings.
+        guard CGPreflightScreenCaptureAccess() else {
+            throw CaptureError.permissionDenied("Screen Recording not granted in System Settings → Privacy & Security")
+        }
+
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(
