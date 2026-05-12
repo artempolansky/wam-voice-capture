@@ -224,6 +224,10 @@ final class StatusBarController: NSObject {
         lightItem.submenu = buildLightSubmenu()
         menu.addItem(lightItem)
 
+        let sendToItem = NSMenuItem(title: "Send to", action: nil, keyEquivalent: "")
+        sendToItem.submenu = buildSendToSubmenu()
+        menu.addItem(sendToItem)
+
         menu.addItem(.separator())
         addTelegramMenuItems(to: menu)
 
@@ -748,6 +752,219 @@ final class StatusBarController: NSObject {
             showError(error.localizedDescription)
             TrayLog.append("mic: switch to \(uid) failed — \(error.localizedDescription)")
         }
+    }
+
+    // MARK: - Light submenu
+
+    // MARK: - Send-to (agent sync) submenu
+
+    private func buildSendToSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Send to")
+        let targets = AgentSyncRegistry.shared.targets
+
+        if targets.isEmpty {
+            let empty = NSMenuItem(title: "No targets configured",
+                                    action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sub.addItem(empty)
+        } else {
+            for t in targets {
+                let title = "\(t.enabled ? "✓ " : "  ")\(t.name)  \(statusGlyph(for: t.status))"
+                let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+                item.submenu = buildTargetSubmenu(for: t)
+                sub.addItem(item)
+            }
+        }
+
+        sub.addItem(.separator())
+        let add = NSMenuItem(title: "Add target…",
+                              action: #selector(addAgentSyncTargetClicked),
+                              keyEquivalent: "")
+        add.target = self
+        sub.addItem(add)
+
+        return sub
+    }
+
+    private func statusGlyph(for status: AgentSyncTarget.Status) -> String {
+        switch status {
+        case .idle:                       return ""
+        case .syncing:                    return "(syncing…)"
+        case .lastSucceeded:              return "(ok)"
+        case .lastFailed(_, let err):     return "(failed: \(err.prefix(40)))"
+        }
+    }
+
+    private func buildTargetSubmenu(for t: AgentSyncTarget) -> NSMenu {
+        let sub = NSMenu(title: t.name)
+
+        let header = NSMenuItem(title: "\(t.user)@\(t.host):\(t.remotePath)",
+                                 action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        sub.addItem(header)
+
+        let toggle = NSMenuItem(title: "Enabled",
+                                 action: #selector(toggleAgentTargetClicked(_:)),
+                                 keyEquivalent: "")
+        toggle.target = self
+        toggle.state = t.enabled ? .on : .off
+        toggle.representedObject = t.id
+        sub.addItem(toggle)
+
+        let includeDicts = NSMenuItem(title: "Include dictations",
+                                       action: #selector(toggleIncludeDictationsClicked(_:)),
+                                       keyEquivalent: "")
+        includeDicts.target = self
+        includeDicts.state = t.includeDictations ? .on : .off
+        includeDicts.representedObject = t.id
+        sub.addItem(includeDicts)
+
+        sub.addItem(.separator())
+
+        let test = NSMenuItem(title: "Test",
+                               action: #selector(testAgentTargetClicked(_:)),
+                               keyEquivalent: "")
+        test.target = self
+        test.representedObject = t.id
+        sub.addItem(test)
+
+        let edit = NSMenuItem(title: "Edit…",
+                               action: #selector(editAgentTargetClicked(_:)),
+                               keyEquivalent: "")
+        edit.target = self
+        edit.representedObject = t.id
+        sub.addItem(edit)
+
+        let remove = NSMenuItem(title: "Remove",
+                                 action: #selector(removeAgentTargetClicked(_:)),
+                                 keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = t.id
+        sub.addItem(remove)
+
+        return sub
+    }
+
+    @objc private func addAgentSyncTargetClicked() {
+        runAgentTargetEditor(existing: nil)
+    }
+
+    @objc private func editAgentTargetClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = AgentSyncRegistry.shared.target(id: id) else { return }
+        runAgentTargetEditor(existing: t)
+    }
+
+    @objc private func toggleAgentTargetClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = AgentSyncRegistry.shared.target(id: id) else { return }
+        t.enabled.toggle()
+        AgentSyncRegistry.shared.addOrUpdate(t)
+        TrayLog.append("agent-sync: target '\(t.name)' enabled=\(t.enabled)")
+    }
+
+    @objc private func toggleIncludeDictationsClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = AgentSyncRegistry.shared.target(id: id) else { return }
+        t.includeDictations.toggle()
+        AgentSyncRegistry.shared.addOrUpdate(t)
+    }
+
+    @objc private func testAgentTargetClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = AgentSyncRegistry.shared.target(id: id) else { return }
+        TrayLog.append("agent-sync: probing '\(t.name)'…")
+        t.probe { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success:
+                    self?.showInfo("Target \"\(t.name)\" reachable",
+                                   info: "rsync + ssh both succeeded. Probe file uploaded and deleted.")
+                case .failure(let err):
+                    self?.showError("Target \"\(t.name)\" failed: \(err.localizedDescription)")
+                }
+                NotificationCenter.default.post(name: AgentSyncRegistry.didChangeNotification, object: nil)
+            }
+        }
+    }
+
+    @objc private func removeAgentTargetClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let t = AgentSyncRegistry.shared.target(id: id) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Remove target \"\(t.name)\"?"
+        alert.informativeText = "Disables sync to \(t.user)@\(t.host):\(t.remotePath). The remote inbox is not touched."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        AgentSyncRegistry.shared.remove(id: id)
+        TrayLog.append("agent-sync: removed target '\(t.name)'")
+    }
+
+    /// Multi-field NSAlert that creates or edits one target. Pattern modeled
+    /// on configureTelegramCredentials above.
+    private func runAgentTargetEditor(existing: AgentSyncTarget?) {
+        let alert = NSAlert()
+        alert.messageText = existing == nil ? "Add sync target" : "Edit \(existing!.name)"
+        alert.informativeText = "Files are rsync'd to <user>@<host>:<remotePath>. Make sure your SSH key is registered on the remote and you have write permission on the path."
+
+        let rowHeight: CGFloat = 26
+        let labelWidth: CGFloat = 100
+        let fieldWidth: CGFloat = 260
+        let rows: [(String, String, Bool)] = [
+            ("Name",        existing?.name ?? "", false),
+            ("Host",        existing?.host ?? "", false),
+            ("User",        existing?.user ?? "", false),
+            ("Remote path", existing?.remotePath ?? "/home/USER/agent/inbox/", false),
+            ("SSH key",     existing?.sshKeyPath ?? "~/.ssh/id_ed25519", false),
+        ]
+        let totalHeight = CGFloat(rows.count) * rowHeight
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: labelWidth + fieldWidth + 8, height: totalHeight))
+        var fields: [NSTextField] = []
+        for (idx, row) in rows.enumerated() {
+            let y = totalHeight - CGFloat(idx + 1) * rowHeight
+            let lbl = NSTextField(labelWithString: row.0)
+            lbl.frame = NSRect(x: 0, y: y + 4, width: labelWidth - 4, height: rowHeight - 4)
+            lbl.alignment = .right
+            container.addSubview(lbl)
+
+            let field = NSTextField(frame: NSRect(x: labelWidth, y: y + 2, width: fieldWidth, height: rowHeight - 4))
+            field.stringValue = row.1
+            field.placeholderString = row.1.isEmpty ? row.0 : ""
+            container.addSubview(field)
+            fields.append(field)
+        }
+        alert.accessoryView = container
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = fields.first
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let values = fields.map { $0.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard values.allSatisfy({ !$0.isEmpty }) else {
+            showError("All fields are required.")
+            return
+        }
+        let target = existing ?? AgentSyncTarget(
+            name: values[0], host: values[1], user: values[2],
+            remotePath: values[3], sshKeyPath: values[4]
+        )
+        target.name = values[0]
+        target.host = values[1]
+        target.user = values[2]
+        target.remotePath = values[3]
+        target.sshKeyPath = values[4]
+        AgentSyncRegistry.shared.addOrUpdate(target)
+        TrayLog.append("agent-sync: saved target '\(target.name)' (\(target.user)@\(target.host):\(target.remotePath))")
+    }
+
+    private func showInfo(_ title: String, info: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = info
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 
     // MARK: - Light submenu

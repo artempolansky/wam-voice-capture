@@ -114,6 +114,9 @@ final class MeetingSession {
 
         isRunning = true
         TrayLog.append("meeting: started -> \(url.path)")
+        // Notify sync targets: file exists, rsync the header immediately so
+        // any watcher on the remote side sees a fresh meeting starting.
+        AgentSyncRegistry.shared.noteSessionStarted(file: url, kind: .meeting)
         onStateChange?(true)
     }
 
@@ -139,6 +142,12 @@ final class MeetingSession {
             self.deepgram = nil
             self.closeFile()
             self.isRunning = false
+            // Final sync + .done marker on every enabled target. This happens
+            // AFTER closeFile() so the file on disk is fully flushed before
+            // rsync runs.
+            if let url = self.transcriptURL {
+                AgentSyncRegistry.shared.noteSessionEnded(file: url, kind: .meeting)
+            }
             self.onStateChange?(false)
             TrayLog.append("meeting: stopped")
         }
@@ -400,6 +409,11 @@ final class MeetingSession {
             do {
                 try handle.write(contentsOf: data)
                 try handle.synchronize()
+                // Tell sync targets the file changed; debounced inside the
+                // registry so rapid-fire appends collapse to one rsync.
+                if let url = self.transcriptURL {
+                    AgentSyncRegistry.shared.noteFileUpdated(file: url, kind: .meeting)
+                }
             } catch {
                 TrayLog.append("meeting: write failed — \(error.localizedDescription)")
             }
@@ -471,6 +485,11 @@ final class MeetingSession {
         } catch {
             TrayLog.append("meeting: failed to reopen handle after rewrite — \(error.localizedDescription)")
         }
+
+        // After rewrite, push the renamed file to sync targets so the agent
+        // sees the updated labels right away. Without this the watcher would
+        // still see "Speaker 2" until the next live append triggered debounce.
+        AgentSyncRegistry.shared.noteFileUpdated(file: url, kind: .meeting)
     }
 
     private func closeFile() {
