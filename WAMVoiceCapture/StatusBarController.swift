@@ -20,10 +20,11 @@ final class StatusBarController: NSObject {
     private var iconBlend: CGFloat = 0
     private var animTimer: Timer?
 
-    // FN: CGEventTap (primary) + NSEvent fallback
+    // Hotkey: CGEventTap on F5 (keycode 96). NSEvent fallback was removed
+    // because it cannot swallow events — F5 would still trigger focused-app
+    // bindings (Chrome refresh etc.). Without CGEventTap permission, hotkey
+    // simply doesn't work and the log says why.
     private var fnTap: FNKeyTap?
-    private var fnMonitor: Any?
-    private var fnFallbackFunctionDown = false
     private var lastFNPressAt = Date.distantPast
     private static let fnDebounce: TimeInterval = 0.15
 
@@ -75,15 +76,15 @@ final class StatusBarController: NSObject {
         }
         let uid = UserDefaults.standard.string(forKey: Self.micDeviceUIDKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            try AudioCapture.shared.setDeviceUID((uid?.isEmpty == false) ? uid : nil)
-            TrayLog.append("audio: always-on engine started (uid=\(uid ?? "default"), pre-roll \(AudioCapture.shared.preRollSeconds)s)")
-        } catch {
-            TrayLog.append("audio: bootstrap failed — \(error.localizedDescription). Will retry on FN-press.")
-        }
-        // Explicit initial — onAvailabilityChange only fires on transitions, so
-        // an unchanged false-from-start (mic missing at boot) needs a manual push.
-        LightControl.shared.setIdleReflectingMic()
+        // On-demand mode: save the user's preferred mic UID but DO NOT start
+        // the engine yet. The macOS green mic indicator stays off until the
+        // user actually starts a dictation or meeting — much less annoying.
+        // Engine starts inside LocalCaptureSession.start / MeetingSession.start
+        // via AudioCapture.ensureRunning(), and stops at the end of each.
+        AudioCapture.shared.setSelectedDevice((uid?.isEmpty == false) ? uid : nil)
+        TrayLog.append("audio: on-demand mode (uid=\(uid ?? "default"), engine starts on first session)")
+        // No initial lamp push — the engine isn't running yet; the lamp stays
+        // at "disconnected" or whatever its last persisted state was.
     }
 
     /// True when AudioCapture's silence-probe cycle exhausted every input
@@ -108,7 +109,6 @@ final class StatusBarController: NSObject {
     deinit {
         animTimer?.invalidate()
         fnTap?.stop()
-        if let m = fnMonitor { NSEvent.removeMonitor(m) }
     }
 
     // MARK: - Status item
@@ -572,31 +572,16 @@ final class StatusBarController: NSObject {
         let pressHandler: () -> Void = { [weak self] in
             Task { @MainActor in await self?.handleFNPress() }
         }
-        let releaseHandler: () -> Void = { [weak self] in
-            Task { @MainActor in self?.handleFNRelease() }
-        }
 
         let tap = FNKeyTap()
-        if tap.start(onPress: pressHandler, onRelease: releaseHandler) {
+        if tap.start(onPress: pressHandler) {
             fnTap = tap
         } else {
-            fnMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
-                let down = event.modifierFlags.contains(.function)
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    if down && !self.fnFallbackFunctionDown {
-                        pressHandler()
-                    } else if !down && self.fnFallbackFunctionDown {
-                        releaseHandler()
-                    }
-                    self.fnFallbackFunctionDown = down
-                }
-            }
-            if fnMonitor == nil {
-                TrayLog.append("FN: NSEvent global monitor also nil — grant Accessibility for WAM Voice Capture")
-            } else {
-                TrayLog.append("FN: NSEvent fallback — both edges via .function")
-            }
+            // No NSEvent fallback: NSEvent global monitor can observe keyDown
+            // but cannot swallow the event, so F5 would still trigger Chrome
+            // refresh etc. Better to fail loudly and have the user fix
+            // permissions than to silently mis-behave.
+            TrayLog.append("Hotkey: install failed — F5 will NOT work until Accessibility & Input Monitoring are granted in System Settings → Privacy & Security.")
         }
     }
 

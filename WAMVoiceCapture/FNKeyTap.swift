@@ -1,72 +1,71 @@
 import AppKit
 import ApplicationServices
 
-/// Глобальный перехват **fn**: `CGEventTap` + `CGEventFlags.maskSecondaryFn`.
-/// На MacBook встроенная клавиша fn часто **не** выставляет `NSEvent.ModifierFlags.function` в глобальном мониторе.
-private enum FNKeyTapStorage {
-    static var lastFnDown = false
+/// Global hotkey tap. Despite the legacy `FNKeyTap` name (kept to minimize
+/// diff with the VoiceMax 1.0.0 baseline), this class no longer listens to
+/// the `fn` modifier — it watches for **F5** key-down events (`keyCode = 96`)
+/// and **swallows them** so the focused app never sees F5 (e.g. Chrome won't
+/// refresh, Notion won't run its own F5 binding).
+///
+/// File-level rename to `HotkeyTap.swift` is intentionally deferred.
+private enum HotkeyTapStorage {
     static var onPress: (() -> Void)?
-    static var onRelease: (() -> Void)?
     static var port: CFMachPort?
+    /// `kVK_F5` from `Carbon/HIToolbox/Events.h`.
+    static let targetKeycode: Int64 = 96
 }
 
-private func fnFlagsChangedCallback(
+private func hotkeyKeyDownCallback(
     proxy: CGEventTapProxy,
     type: CGEventType,
     event: CGEvent,
     refcon: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    // macOS disables the tap on timeout / user input; we must re-enable it ourselves.
+    // macOS disables the tap on timeout / user input; re-enable it ourselves.
     if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-        if let tap = FNKeyTapStorage.port {
+        if let tap = HotkeyTapStorage.port {
             CGEvent.tapEnable(tap: tap, enable: true)
             DispatchQueue.main.async {
-                TrayLog.append("FN: tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
+                TrayLog.append("Hotkey: tap re-enabled after \(type == .tapDisabledByTimeout ? "timeout" : "user input")")
             }
         }
         return Unmanaged.passUnretained(event)
     }
-    guard type == .flagsChanged else {
+    guard type == .keyDown else {
         return Unmanaged.passUnretained(event)
     }
 
-    let cgFn = event.flags.contains(.maskSecondaryFn)
-    var nsFn = false
-    if let nse = NSEvent(cgEvent: event) {
-        nsFn = nse.modifierFlags.contains(.function)
-    }
-    let fnNow = cgFn || nsFn
-
-    if fnNow && !FNKeyTapStorage.lastFnDown {
-        FNKeyTapStorage.lastFnDown = true
-        DispatchQueue.main.async { FNKeyTapStorage.onPress?() }
-    } else if !fnNow && FNKeyTapStorage.lastFnDown {
-        FNKeyTapStorage.lastFnDown = false
-        DispatchQueue.main.async { FNKeyTapStorage.onRelease?() }
+    let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+    guard keycode == HotkeyTapStorage.targetKeycode else {
+        // Not F5 — pass through untouched.
+        return Unmanaged.passUnretained(event)
     }
 
-    return Unmanaged.passUnretained(event)
+    DispatchQueue.main.async { HotkeyTapStorage.onPress?() }
+
+    // Return nil to drop the event so the focused app never sees F5.
+    // Chrome / Slack / Finder etc. won't run their own F5 bindings.
+    return nil
 }
 
-/// Устанавливает event tap на главном run loop (нужны права Accessibility / Ввод с клавиатуры).
+/// Installs a CGEventTap on the main run loop. Requires Accessibility +
+/// Input Monitoring permissions in System Settings → Privacy & Security.
 final class FNKeyTap {
     private var port: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
-    /// `true` если tap установлен; иначе нужен fallback (`NSEvent`).
-    /// `onRelease` is optional — fires on the FN-up edge for callers that
-    /// need hold semantics (e.g. push-to-record-me during a meeting).
+    /// `true` if the tap was installed successfully.
+    /// `onRelease` is kept in the signature for source compatibility with
+    /// the VoiceMax 1.0.0 call site but is no longer invoked — F5 is a
+    /// press-to-toggle hotkey, no key-up semantics needed.
     @discardableResult
     func start(onPress: @escaping () -> Void,
                onRelease: (() -> Void)? = nil) -> Bool {
         stop()
-        FNKeyTapStorage.onPress = onPress
-        FNKeyTapStorage.onRelease = onRelease
-        FNKeyTapStorage.lastFnDown = false
+        HotkeyTapStorage.onPress = onPress
 
-        // flagsChanged + tap-disabled notifications so we can re-enable on timeout / user input.
         let mask = CGEventMask(
-            (1 << CGEventType.flagsChanged.rawValue) |
+            (1 << CGEventType.keyDown.rawValue) |
             (1 << CGEventType.tapDisabledByTimeout.rawValue) |
             (1 << CGEventType.tapDisabledByUserInput.rawValue)
         )
@@ -75,22 +74,22 @@ final class FNKeyTap {
             place: .headInsertEventTap,
             options: .defaultTap,
             eventsOfInterest: mask,
-            callback: fnFlagsChangedCallback,
+            callback: hotkeyKeyDownCallback,
             userInfo: nil
         ) else {
-            TrayLog.append("FN: CGEvent.tapCreate failed — System Settings → Privacy → Accessibility & Input Monitoring → WAM Voice Capture")
+            TrayLog.append("Hotkey: CGEvent.tapCreate failed — System Settings → Privacy → Accessibility & Input Monitoring → WAM Voice Capture")
             return false
         }
 
         port = tap
-        FNKeyTapStorage.port = tap
+        HotkeyTapStorage.port = tap
         CGEvent.tapEnable(tap: tap, enable: true)
 
         let src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         runLoopSource = src
         CFRunLoopAddSource(CFRunLoopGetMain(), src, .commonModes)
 
-        TrayLog.append("FN: CGEventTap installed (fn key)")
+        TrayLog.append("Hotkey: CGEventTap installed (keycode=\(HotkeyTapStorage.targetKeycode) [F5], swallow=true)")
         return true
     }
 
@@ -104,10 +103,8 @@ final class FNKeyTap {
             CFMachPortInvalidate(tap)
             port = nil
         }
-        FNKeyTapStorage.onPress = nil
-        FNKeyTapStorage.onRelease = nil
-        FNKeyTapStorage.lastFnDown = false
-        FNKeyTapStorage.port = nil
+        HotkeyTapStorage.onPress = nil
+        HotkeyTapStorage.port = nil
     }
 
     deinit { stop() }
