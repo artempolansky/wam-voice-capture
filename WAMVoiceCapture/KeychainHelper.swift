@@ -14,12 +14,15 @@ enum KeychainHelper {
         static let deepgramAPIKey    = "wam-voice-capture.deepgram.api_key"
         static let legacyDeepgramVM  = "voicemax.deepgram.api_key"
         static let legacyDeepgramOC  = "openclaw.deepgram.api_key"
-        static let telegramAPIID     = "wam-voice-capture.telegram.api_id"
-        static let legacyTelegramID  = "voicemax.telegram.api_id"
-        static let telegramAPIHash   = "wam-voice-capture.telegram.api_hash"
-        static let legacyTelegramHash = "voicemax.telegram.api_hash"
-        static let tdlibDatabaseKey  = "wam-voice-capture.tdlib_db_key"
-        static let legacyTdlibDBKey  = "voicemax.tdlib_db_key"
+        // Legacy Telegram/TDLib keys: TDLib delivery was retired in favor of
+        // file-sync (Phase 7a). These are listed only so Migration can clean
+        // them up on upgrade.
+        static let legacyTelegramVMID     = "voicemax.telegram.api_id"
+        static let legacyTelegramVMHash   = "voicemax.telegram.api_hash"
+        static let legacyTelegramWAMID    = "wam-voice-capture.telegram.api_id"
+        static let legacyTelegramWAMHash  = "wam-voice-capture.telegram.api_hash"
+        static let legacyTdlibDBVM        = "voicemax.tdlib_db_key"
+        static let legacyTdlibDBWAM       = "wam-voice-capture.tdlib_db_key"
     }
 
     enum Error: LocalizedError {
@@ -124,84 +127,22 @@ enum KeychainHelper {
         return SecItemDelete(query as CFDictionary)
     }
 
-    // MARK: - Telegram app credentials
+    // MARK: - Legacy cleanup
 
-    struct TelegramCredentials {
-        let apiID: Int32
-        let apiHash: String
-    }
-
-    static func telegramCredentials() -> TelegramCredentials? {
-        // Read new keys; if missing, fall back to legacy `voicemax.*` and migrate forward.
-        var idStr = try? readString(service: Service.telegramAPIID, account: "telegram")
-        var hashStr = try? readString(service: Service.telegramAPIHash, account: "telegram")
-        if idStr == nil || (idStr?.isEmpty ?? true) {
-            if let legacyID = try? readString(service: Service.legacyTelegramID, account: "telegram"),
-               !legacyID.isEmpty {
-                try? writeString(service: Service.telegramAPIID, account: "telegram", value: legacyID)
-                _ = deleteItem(service: Service.legacyTelegramID, account: "telegram")
-                idStr = legacyID
-            }
+    /// Remove any leftover Telegram / TDLib Keychain entries from VoiceMax 1.0.0
+    /// or the early WAM rebrand. Called once by `Migration.runOnce()`. Silent
+    /// if nothing exists.
+    static func removeLegacyTelegramAndTDLibKeys() {
+        let pairs: [(String, String)] = [
+            (Service.legacyTelegramVMID,    "telegram"),
+            (Service.legacyTelegramVMHash,  "telegram"),
+            (Service.legacyTelegramWAMID,   "telegram"),
+            (Service.legacyTelegramWAMHash, "telegram"),
+            (Service.legacyTdlibDBVM,       "tdlib"),
+            (Service.legacyTdlibDBWAM,      "tdlib"),
+        ]
+        for (service, account) in pairs {
+            _ = deleteItem(service: service, account: account)
         }
-        if hashStr == nil || (hashStr?.isEmpty ?? true) {
-            if let legacyHash = try? readString(service: Service.legacyTelegramHash, account: "telegram"),
-               !legacyHash.isEmpty {
-                try? writeString(service: Service.telegramAPIHash, account: "telegram", value: legacyHash)
-                _ = deleteItem(service: Service.legacyTelegramHash, account: "telegram")
-                hashStr = legacyHash
-            }
-        }
-        guard
-            let idStr,
-            let id = Int32(idStr.trimmingCharacters(in: .whitespacesAndNewlines)),
-            let hash = hashStr,
-            !hash.isEmpty
-        else { return nil }
-        return TelegramCredentials(apiID: id, apiHash: hash)
-    }
-
-    static func setTelegramCredentials(apiID: Int32, apiHash: String) throws {
-        try writeString(service: Service.telegramAPIID,  account: "telegram", value: String(apiID))
-        try writeString(service: Service.telegramAPIHash, account: "telegram", value: apiHash)
-        _ = deleteItem(service: Service.legacyTelegramID,   account: "telegram")
-        _ = deleteItem(service: Service.legacyTelegramHash, account: "telegram")
-    }
-
-    static func clearTelegramCredentials() {
-        _ = deleteItem(service: Service.telegramAPIID,  account: "telegram")
-        _ = deleteItem(service: Service.telegramAPIHash, account: "telegram")
-        _ = deleteItem(service: Service.legacyTelegramID,   account: "telegram")
-        _ = deleteItem(service: Service.legacyTelegramHash, account: "telegram")
-    }
-
-    // MARK: - TDLib database key
-
-    /// 32 random bytes used as `database_encryption_key` for TDLib.
-    /// Generated once, stored base64 in Keychain. Losing it = losing the session.
-    static func tdlibDatabaseKey() throws -> Data {
-        if let b64 = try? readString(service: Service.tdlibDatabaseKey, account: "tdlib"),
-           let data = Data(base64Encoded: b64), data.count == 32 {
-            return data
-        }
-        // Migrate from legacy `voicemax.tdlib_db_key` if present (preserves session).
-        if let b64 = try? readString(service: Service.legacyTdlibDBKey, account: "tdlib"),
-           let data = Data(base64Encoded: b64), data.count == 32 {
-            try? writeString(service: Service.tdlibDatabaseKey, account: "tdlib", value: b64)
-            _ = deleteItem(service: Service.legacyTdlibDBKey, account: "tdlib")
-            return data
-        }
-        var bytes = [UInt8](repeating: 0, count: 32)
-        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-        guard status == errSecSuccess else {
-            throw Error.osStatus("SecRandomCopyBytes", status)
-        }
-        let data = Data(bytes)
-        try writeString(service: Service.tdlibDatabaseKey, account: "tdlib", value: data.base64EncodedString())
-        return data
-    }
-
-    static func clearTDLibDatabaseKey() {
-        _ = deleteItem(service: Service.tdlibDatabaseKey, account: "tdlib")
-        _ = deleteItem(service: Service.legacyTdlibDBKey, account: "tdlib")
     }
 }

@@ -72,11 +72,17 @@ final class DeepgramClient: NSObject {
     var bytesSent:  Int { lock.withLock { _bytesSent } }
 
     init(apiKey: String,
-         language: String = "multi",
+         language: String = "ru",
          model: String = "nova-3",
          channels: Int = 1,
          multichannel: Bool = false,
          diarize: Bool = false) {
+        // Default `language=ru` based on real-world testing: `multi` mode on
+        // nova-3 misrecognized Russian as French ("Voulais juste" for "Раз
+        // два три"). For users whose meetings are mostly English / other
+        // languages, future Phase 8 STT picker will let them override. For
+        // now: hard default to ru — it's the empirically-correct choice for
+        // this owner's workload.
         self.apiKey = apiKey
         self.language = language
         self.model = model

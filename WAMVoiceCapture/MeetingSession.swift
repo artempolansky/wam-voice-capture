@@ -385,11 +385,12 @@ final class MeetingSession {
     // MARK: - File
 
     private func makeTranscriptURL() throws -> URL {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("WAM Voice Capture Recordings", isDirectory: true)
+        let dir = RecordingsFolder.currentURL()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // Seconds in the stem so two meetings started within the same minute
+        // don't overwrite each other (a real bug in earlier builds).
         let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd-HHmm"
+        fmt.dateFormat = "yyyy-MM-dd-HHmmss"
         let stem = fmt.string(from: Date())
         return dir.appendingPathComponent("\(stem)-meeting.md")
     }
