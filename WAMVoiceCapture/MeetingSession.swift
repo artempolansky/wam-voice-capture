@@ -79,7 +79,11 @@ final class MeetingSession {
 
     // MARK: - Lifecycle
 
-    func start() throws {
+    /// Start a meeting. If `event` is nil, the caller didn't pick one — but
+    /// MeetingSession still tries to auto-detect one via CalendarBridge if the
+    /// calendar permission is granted. Either way, the event (if any) is used
+    /// for filename and YAML frontmatter.
+    func start(event: CalendarBridge.Event? = nil) throws {
         guard !isRunning else { throw SessionError.alreadyRunning }
 
         do {
@@ -90,9 +94,12 @@ final class MeetingSession {
 
         try AudioCapture.shared.ensureRunning()
 
-        let url = try makeTranscriptURL()
+        // Resolve event: explicit > auto-detected from "now ± 5 min".
+        let resolvedEvent = event ?? CalendarBridge.shared.currentEvent()
+
+        let url = try makeTranscriptURL(event: resolvedEvent)
         transcriptURL = url
-        guard let handle = try? openTranscriptFile(at: url) else {
+        guard let handle = try? openTranscriptFile(at: url, event: resolvedEvent) else {
             throw SessionError.fileCreate(url.path)
         }
         fileHandle = handle
@@ -384,7 +391,7 @@ final class MeetingSession {
 
     // MARK: - File
 
-    private func makeTranscriptURL() throws -> URL {
+    private func makeTranscriptURL(event: CalendarBridge.Event?) throws -> URL {
         let dir = RecordingsFolder.currentURL()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         // Seconds in the stem so two meetings started within the same minute
@@ -392,15 +399,73 @@ final class MeetingSession {
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd-HHmmss"
         let stem = fmt.string(from: Date())
-        return dir.appendingPathComponent("\(stem)-meeting.md")
+        // Event-aware name: "2026-05-18-143012-standup-with-anya.md".
+        // Without an event: "2026-05-18-143012-meeting.md".
+        let suffix: String
+        if let event, !event.filenameSlug.isEmpty {
+            suffix = event.filenameSlug
+        } else {
+            suffix = "meeting"
+        }
+        return dir.appendingPathComponent("\(stem)-\(suffix).md")
     }
 
-    private func openTranscriptFile(at url: URL) throws -> FileHandle {
-        let header = "# Meeting \(url.deletingPathExtension().lastPathComponent)\n\n"
+    private func openTranscriptFile(at url: URL, event: CalendarBridge.Event?) throws -> FileHandle {
+        let header = renderHeader(at: url, event: event)
         try header.write(to: url, atomically: true, encoding: .utf8)
         let handle = try FileHandle(forWritingTo: url)
         try handle.seekToEnd()
         return handle
+    }
+
+    /// File header. With an event, includes YAML frontmatter + title; without,
+    /// the legacy `# Meeting <stem>` line for backwards compatibility with
+    /// existing agent watchers.
+    private func renderHeader(at url: URL, event: CalendarBridge.Event?) -> String {
+        guard let event else {
+            return "# Meeting \(url.deletingPathExtension().lastPathComponent)\n\n"
+        }
+
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm"
+        let dateFmt = DateFormatter()
+        dateFmt.dateFormat = "yyyy-MM-dd"
+
+        var lines: [String] = ["---"]
+        lines.append("title: \(yamlSafe(event.title))")
+        lines.append("date: \(dateFmt.string(from: event.startDate))")
+        lines.append("start: \(timeFmt.string(from: event.startDate))")
+        lines.append("end: \(timeFmt.string(from: event.endDate))")
+        if !event.attendees.isEmpty {
+            let attendees = event.attendees.map { yamlSafe($0) }.joined(separator: ", ")
+            lines.append("attendees: [\(attendees)]")
+        }
+        if let conf = event.conferenceURL {
+            lines.append("link: \(conf.absoluteString)")
+        }
+        lines.append("calendar: \(yamlSafe(event.calendarSource))")
+        lines.append("calendar_event_id: \(event.identifier)")
+        lines.append("---")
+        lines.append("")
+        lines.append("# \(event.title)")
+        lines.append("")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Quote-and-escape a value if it contains characters YAML treats specially.
+    /// Keeps simple values bare so a `cat <file>` of the transcript still reads cleanly.
+    private func yamlSafe(_ value: String) -> String {
+        let needsQuote = value.contains(":") || value.contains("#") || value.contains("\n") ||
+                         value.contains(",") || value.hasPrefix("[") || value.hasPrefix("{") ||
+                         value.hasPrefix("-") || value.contains("\"")
+        if needsQuote {
+            let escaped = value
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+                .replacingOccurrences(of: "\n", with: " ")
+            return "\"\(escaped)\""
+        }
+        return value
     }
 
     private func appendLine(_ text: String, label: String) {

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Phase 5: Calendar integration via EventKit (closes #6).
+  - Tray menu **Today ▸** lists today's events (start–end + title), with `●` marking events live right now. Click an event to start a meeting tied to it.
+  - On Start meeting, if a calendar event is active in the now ± 5 min window, the transcript file is auto-named with the event slug (`2026-05-18-143012-standup-with-anya.md` instead of `…-meeting.md`) and gets a YAML frontmatter header with title, date, start/end, attendees, conferencing URL (Zoom/Meet/Teams parsed from notes/url/location), calendar source, and `calendar_event_id`.
+  - No event in window → fallback to the existing `…-meeting.md` filename with the legacy `# Meeting <stem>` header. Backwards-compatible with existing agent watchers.
+  - First-time calendar access requested via `EventKit.requestFullAccessToEvents()` (macOS 14+). Permission denied → Today submenu shows a link to System Settings; meetings still work without it.
+  - `NSCalendarsUsageDescription` already present in Info.plist from Phase 1.
+- New file `CalendarBridge.swift` — wraps `EKEventStore` with read-only API: `requestAccess()`, `todaysEvents()`, `currentEvent()`. Parses conference URLs from event notes/url/location using `NSDataDetector` + a list of known hosts.
+
 ### Removed
 - TDLib (Telegram client) — retired in favor of file-sync (Phase 7a / AgentSyncTarget). Drops ~10 MB from the bundle (11 MB → 1 MB), removes the Homebrew dependency from `install.sh`, deletes `TelegramClient.swift`, `TDLibBridge.h`, `docs/TDLIB_BUILD.md`, all `TELEGRAM_BUILD` conditionals, and the Telegram menu items from the tray. `Migration.runOnce()` now also wipes the leftover `tdlib/`, `tdlib-files/` directories and the legacy Telegram/TDLib Keychain entries on first run after this upgrade.
 
