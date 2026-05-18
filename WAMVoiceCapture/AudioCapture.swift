@@ -115,10 +115,30 @@ final class AudioCapture {
 
     // MARK: - Lifecycle (main-thread only)
 
-    /// Idempotent. Safe to call on every FN-press.
+    /// Idempotent. Safe to call on every hotkey-press / session start.
+    /// Brings the engine up if it isn't running, using the previously
+    /// configured `currentDeviceUID` (set via `setSelectedDevice(_:)` at
+    /// app launch or via `setDeviceUID(_:)` from the tray mic picker).
     func ensureRunning() throws {
         if engine.isRunning { return }
         try startEngine()
+    }
+
+    /// Public stop. Idempotent. Brings the engine down so the macOS green
+    /// mic indicator disappears from the menubar between sessions.
+    /// Safe to call on every session end.
+    func stop() {
+        guard engine.isRunning else { return }
+        TrayLog.append("audio: stopping engine (on-demand mode)")
+        stopEngine()
+    }
+
+    /// Store the user's preferred input device UID **without** starting the
+    /// engine. Used at app launch in on-demand mode — the engine starts on
+    /// first session and reads this UID then. Pass `nil` for system default.
+    func setSelectedDevice(_ uid: String?) {
+        let trimmed = uid?.trimmingCharacters(in: .whitespacesAndNewlines)
+        currentDeviceUID = (trimmed?.isEmpty == false) ? trimmed : nil
     }
 
     private var probeTask: Task<Void, Never>?

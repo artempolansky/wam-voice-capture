@@ -148,6 +148,11 @@ final class MeetingSession {
             if let url = self.transcriptURL {
                 AgentSyncRegistry.shared.noteSessionEnded(file: url, kind: .meeting)
             }
+            // On-demand mic: stop the engine so the menubar indicator goes
+            // away. Note that AgentSyncRegistry.noteSessionEnded above is
+            // async — it kicks off the final rsync on a background queue.
+            // Stopping the audio engine doesn't interfere with rsync.
+            AudioCapture.shared.stop()
             self.onStateChange?(false)
             TrayLog.append("meeting: stopped")
         }

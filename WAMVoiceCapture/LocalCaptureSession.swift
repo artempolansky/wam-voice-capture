@@ -271,6 +271,9 @@ final class LocalCaptureSession {
         onFinish?(text)
         if !text.isEmpty { PasteDelivery.paste(text) }
 
+        // On-demand mic: shut the engine back down so the menubar mic
+        // indicator goes away between sessions.
+        AudioCapture.shared.stop()
         LightControl.shared.setIdleReflectingMic()
     }
 }
