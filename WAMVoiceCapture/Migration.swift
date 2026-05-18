@@ -39,6 +39,13 @@ enum Migration {
     /// up with two directories on disk.
     static func runOnce() {
         let defaults = UserDefaults.standard
+
+        // TDLib cleanup runs every launch (cheap, idempotent). Run UNGUARDED
+        // by the flag because users who already migrated from VoiceMax 1.0.0
+        // (flag is set) still need this one-off TDLib removal on upgrade.
+        // Subsequent launches no-op once the dirs are gone.
+        cleanupRetiredTDLibArtifacts()
+
         guard !defaults.bool(forKey: flagKey) else { return }
 
         migrateUserDefaults(defaults: defaults)
@@ -48,6 +55,25 @@ enum Migration {
         // Direct stderr — TrayLog isn't safe yet on the very first call after
         // a fresh upgrade because its file path resolves to the just-renamed dir.
         fputs("WAM: legacy migration from VoiceMax 1.0.0 completed\n", stderr)
+    }
+
+    /// Remove TDLib leftovers (encrypted SQLite DB + downloaded files + Keychain
+    /// keys) from VoiceMax 1.0.0 / early WAM builds. TDLib-based delivery was
+    /// retired in favor of file-sync (Phase 7a) so these artifacts only waste
+    /// disk space and a Keychain slot.
+    private static func cleanupRetiredTDLibArtifacts() {
+        let fm = FileManager.default
+        if let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let appSupport = base.appendingPathComponent("WAM Voice Capture", isDirectory: true)
+            for name in ["tdlib", "tdlib-files"] {
+                let dir = appSupport.appendingPathComponent(name, isDirectory: true)
+                if fm.fileExists(atPath: dir.path) {
+                    try? fm.removeItem(at: dir)
+                    fputs("WAM: removed retired TDLib dir \(name)\n", stderr)
+                }
+            }
+        }
+        KeychainHelper.removeLegacyTelegramAndTDLibKeys()
     }
 
     private static func migrateUserDefaults(defaults: UserDefaults) {

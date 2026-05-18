@@ -36,16 +36,8 @@ final class StatusBarController: NSObject {
         super.init()
         setupStatusItem()
         setupFNListener()
-        setupTelegramClient()
         setupAudio()
         setupMeetingSession()
-    }
-
-    private func setupTelegramClient() {
-        TelegramClient.shared.onStatusChange = { [weak self] _ in
-            Task { @MainActor [weak self] in self?.handleTelegramStatusChange() }
-        }
-        TelegramClient.shared.start()
     }
 
     private func setupAudio() {
@@ -228,9 +220,6 @@ final class StatusBarController: NSObject {
         sendToItem.submenu = buildSendToSubmenu()
         menu.addItem(sendToItem)
 
-        menu.addItem(.separator())
-        addTelegramMenuItems(to: menu)
-
         if #available(macOS 13.0, *) {
             menu.addItem(.separator())
             let login = NSMenuItem(
@@ -301,12 +290,47 @@ final class StatusBarController: NSObject {
             start.target = self
             menu.addItem(start)
 
-            let openFolder = NSMenuItem(title: "Open recordings folder…",
-                                        action: #selector(openRecordingsFolder),
-                                        keyEquivalent: "")
-            openFolder.target = self
-            menu.addItem(openFolder)
+            let folderItem = NSMenuItem(title: "Recordings folder", action: nil, keyEquivalent: "")
+            folderItem.submenu = buildRecordingsFolderSubmenu()
+            menu.addItem(folderItem)
         }
+    }
+
+    private func buildRecordingsFolderSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Recordings folder")
+
+        // Header — shows the current path (truncated if long).
+        let header = NSMenuItem(
+            title: RecordingsFolder.isCustom
+                ? "Custom: \(RecordingsFolder.displayPath())"
+                : "Default: ~/Documents/WAM Voice Capture Recordings/",
+            action: nil,
+            keyEquivalent: ""
+        )
+        header.isEnabled = false
+        sub.addItem(header)
+
+        let open = NSMenuItem(title: "Open in Finder",
+                              action: #selector(openRecordingsFolder),
+                              keyEquivalent: "")
+        open.target = self
+        sub.addItem(open)
+
+        let change = NSMenuItem(title: "Change…",
+                                action: #selector(changeRecordingsFolder),
+                                keyEquivalent: "")
+        change.target = self
+        sub.addItem(change)
+
+        if RecordingsFolder.isCustom {
+            let reset = NSMenuItem(title: "Reset to default",
+                                    action: #selector(resetRecordingsFolder),
+                                    keyEquivalent: "")
+            reset.target = self
+            sub.addItem(reset)
+        }
+
+        return sub
     }
 
     private func formatElapsed(_ seconds: TimeInterval) -> String {
@@ -360,10 +384,28 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func openRecordingsFolder() {
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent("WAM Voice Capture Recordings", isDirectory: true)
+        let dir = RecordingsFolder.currentURL()
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         NSWorkspace.shared.open(dir)
+    }
+
+    @objc private func changeRecordingsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.message = "Pick a folder for meeting transcripts. iCloud Drive, Dropbox, external volumes — all fine."
+        panel.prompt = "Choose"
+        panel.directoryURL = RecordingsFolder.currentURL()
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        RecordingsFolder.setConfigured(url)
+        TrayLog.append("recordings: folder set to \(url.path)")
+    }
+
+    @objc private func resetRecordingsFolder() {
+        RecordingsFolder.setConfigured(nil)
+        TrayLog.append("recordings: folder reset to default (\(RecordingsFolder.defaultURL().path))")
     }
 
     private func setupMeetingSession() {
@@ -380,178 +422,8 @@ final class StatusBarController: NSObject {
         }
     }
 
-    // MARK: - Telegram menu
-
-    #if TELEGRAM_BUILD
-    private var lastTelegramAuthStage: TelegramClient.Status = .idle
-    private var connectInFlight = false
-    #endif
-
-    private func addTelegramMenuItems(to menu: NSMenu) {
-        #if TELEGRAM_BUILD
-        let status = TelegramClient.shared.status
-        let header = NSMenuItem(title: "Telegram: \(status.menuText)", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-
-        switch status {
-        case .needCredentials, .idle, .error:
-            let creds = NSMenuItem(
-                title: KeychainHelper.telegramCredentials() == nil
-                    ? "Telegram app credentials…"
-                    : "Telegram app credentials… (set)",
-                action: #selector(configureTelegramCredentials),
-                keyEquivalent: ""
-            )
-            creds.target = self
-            menu.addItem(creds)
-
-            if KeychainHelper.telegramCredentials() != nil {
-                let connect = NSMenuItem(title: "Telegram: Connect…",
-                                         action: #selector(connectTelegram),
-                                         keyEquivalent: "")
-                connect.target = self
-                menu.addItem(connect)
-            }
-        case .ready:
-            let logout = NSMenuItem(title: "Telegram: Logout",
-                                    action: #selector(logoutTelegram),
-                                    keyEquivalent: "")
-            logout.target = self
-            menu.addItem(logout)
-        case .waitingPhone, .waitingCode, .waitingPassword:
-            break
-        }
-        #else
-        let header = NSMenuItem(title: "Telegram: TDLib not installed", action: nil, keyEquivalent: "")
-        header.isEnabled = false
-        menu.addItem(header)
-        #endif
-    }
-
-    private func handleTelegramStatusChange() {
-        #if TELEGRAM_BUILD
-        let status = TelegramClient.shared.status
-        defer { lastTelegramAuthStage = status }
-        guard connectInFlight else { return }
-        guard status != lastTelegramAuthStage else { return }
-        switch status {
-        case .waitingPhone:
-            promptPhone()
-        case .waitingCode:
-            promptCode()
-        case .waitingPassword:
-            promptPassword()
-        case .ready, .idle, .error:
-            connectInFlight = false
-        default:
-            break
-        }
-        #endif
-    }
-
-    @objc private func configureTelegramCredentials() {
-        #if TELEGRAM_BUILD
-        let alert = NSAlert()
-        alert.messageText = "Telegram app credentials"
-        alert.informativeText = "Получить на my.telegram.org → API Development Tools. Сохранятся в login Keychain (wam-voice-capture.telegram.api_id / api_hash)."
-        let container = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 60))
-        let idField = NSTextField(frame: NSRect(x: 0, y: 32, width: 360, height: 22))
-        idField.placeholderString = "api_id (integer)"
-        let hashField = NSTextField(frame: NSRect(x: 0, y: 2, width: 360, height: 22))
-        hashField.placeholderString = "api_hash"
-        container.addSubview(idField)
-        container.addSubview(hashField)
-        alert.accessoryView = container
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = idField
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let idText = idField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hashText = hashField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let apiID = Int32(idText), !hashText.isEmpty else {
-            showError("api_id must be integer, api_hash non-empty")
-            return
-        }
-        do {
-            try KeychainHelper.setTelegramCredentials(apiID: apiID, apiHash: hashText)
-            TrayLog.append("tg: credentials saved, restarting client")
-            TelegramClient.shared.start()
-        } catch {
-            showError(error.localizedDescription)
-        }
-        #endif
-    }
-
-    @objc private func connectTelegram() {
-        #if TELEGRAM_BUILD
-        connectInFlight = true
-        let s = TelegramClient.shared.status
-        switch s {
-        case .waitingPhone:    promptPhone()
-        case .waitingCode:     promptCode()
-        case .waitingPassword: promptPassword()
-        default:
-            TelegramClient.shared.start()
-        }
-        #endif
-    }
-
-    @objc private func logoutTelegram() {
-        #if TELEGRAM_BUILD
-        let alert = NSAlert()
-        alert.messageText = "Log out of Telegram?"
-        alert.informativeText = "Сессия и ключ базы будут удалены. Для повторного подключения придётся снова ввести код."
-        alert.addButton(withTitle: "Log out")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        TelegramClient.shared.logoutAndWipe()
-        #endif
-    }
-
-    #if TELEGRAM_BUILD
-    private func promptPhone() {
-        let v = prompt(title: "Telegram phone number",
-                       info: "В международном формате, напр. +79686446490.",
-                       placeholder: "+1234567890",
-                       secure: false)
-        if let v { TelegramClient.shared.submitPhone(v) } else { connectInFlight = false }
-    }
-
-    private func promptCode() {
-        let v = prompt(title: "Verification code",
-                       info: "Код из Telegram (в мессенджере) или SMS.",
-                       placeholder: "12345",
-                       secure: false)
-        if let v { TelegramClient.shared.submitCode(v) } else { connectInFlight = false }
-    }
-
-    private func promptPassword() {
-        let v = prompt(title: "Cloud password (2FA)",
-                       info: "Пароль облачного Telegram.",
-                       placeholder: "",
-                       secure: true)
-        if let v { TelegramClient.shared.submitPassword(v) } else { connectInFlight = false }
-    }
-
-    private func prompt(title: String, info: String, placeholder: String, secure: Bool) -> String? {
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = info
-        let field: NSTextField = secure
-            ? NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-            : NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = placeholder
-        alert.accessoryView = field
-        alert.addButton(withTitle: "OK")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let v = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        return v.isEmpty ? nil : v
-    }
-    #endif
+    // Telegram menu removed: TDLib-based delivery was replaced by file-sync
+    // (Phase 7a / AgentSyncTarget). See PRs around #17 epic.
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
         guard #available(macOS 13.0, *) else { return }
@@ -887,7 +759,7 @@ final class StatusBarController: NSObject {
     }
 
     /// Multi-field NSAlert that creates or edits one target. Pattern modeled
-    /// on configureTelegramCredentials above.
+    /// multi-field NSAlert pattern.
     private func runAgentTargetEditor(existing: AgentSyncTarget?) {
         let alert = NSAlert()
         alert.messageText = existing == nil ? "Add sync target" : "Edit \(existing!.name)"

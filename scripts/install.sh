@@ -10,22 +10,6 @@ APP_NAME="WAM Voice Capture"
 APP_BUNDLE="${APP_NAME}.app"
 BIN_NAME="WAMVoiceCapture"
 
-# TDLib via Homebrew. Optional — if missing, build proceeds without Telegram
-# support and the tray menu shows "TDLib not installed".
-# Note: Phase 7 will replace TDLib with the simpler Telegram Bot API; this
-# block goes away then.
-if command -v brew >/dev/null 2>&1; then
-  if brew list --versions tdlib >/dev/null 2>&1; then
-    echo "==> tdlib already installed ($(brew --prefix tdlib))"
-  else
-    echo "==> Installing tdlib via Homebrew (first time — may take several minutes)..."
-    brew install tdlib
-  fi
-else
-  echo "==> brew not found — skipping tdlib install. Telegram features will be disabled."
-  echo "    Install Homebrew from https://brew.sh, then re-run this script."
-fi
-
 echo "==> Building ${APP_BUNDLE}..."
 bash scripts/build-app.sh
 

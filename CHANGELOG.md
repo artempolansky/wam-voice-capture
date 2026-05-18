@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- TDLib (Telegram client) — retired in favor of file-sync (Phase 7a / AgentSyncTarget). Drops ~10 MB from the bundle (11 MB → 1 MB), removes the Homebrew dependency from `install.sh`, deletes `TelegramClient.swift`, `TDLibBridge.h`, `docs/TDLIB_BUILD.md`, all `TELEGRAM_BUILD` conditionals, and the Telegram menu items from the tray. `Migration.runOnce()` now also wipes the leftover `tdlib/`, `tdlib-files/` directories and the legacy Telegram/TDLib Keychain entries on first run after this upgrade.
+
+### Changed
+- Default Deepgram `language` switched from `multi` to `ru`. The `multi` mode misrecognized Russian dictation as French in real-world testing (\"Voulais juste\" for \"Раз два три\"). Phase 8 will add a language picker; until then `ru` is the empirically-correct default for this owner's workload.
+- Meeting transcript filenames now include seconds: `YYYY-MM-DD-HHMMSS-meeting.md` (was `YYYY-MM-DD-HHMM-meeting.md`). Fixes a real bug where two meetings started in the same minute overwrote each other.
+
+### Added
+- Phase 3: recordings folder picker. Tray menu **Recordings folder ▸** now exposes the current path, **Open in Finder**, **Change…** (NSOpenPanel), and **Reset to default**. Configurable destination persists in `UserDefaults` (key `WAMRecordingsFolder`). iCloud Drive / Dropbox / external volumes all work — no security-scoped bookmarks needed because the app is not sandboxed.
+- New file `RecordingsFolder.swift` — small helper centralizing the current-target resolution + fallback to default if the configured path is gone (e.g. external volume unmounted).
+
 ### Added
 - Phase 7a: `AgentSyncTarget` + `AgentSyncRegistry` — generic rsync-over-SSH delivery of meeting transcripts to a configurable remote `inbox/`. ([#18](https://github.com/artempolansky/wam-voice-capture/issues/18))
   - One or more sync targets per machine, each independently togglable
