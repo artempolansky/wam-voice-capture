@@ -290,9 +290,89 @@ final class StatusBarController: NSObject {
             start.target = self
             menu.addItem(start)
 
+            let todayItem = NSMenuItem(title: "Today", action: nil, keyEquivalent: "")
+            todayItem.submenu = buildTodaySubmenu()
+            menu.addItem(todayItem)
+
             let folderItem = NSMenuItem(title: "Recordings folder", action: nil, keyEquivalent: "")
             folderItem.submenu = buildRecordingsFolderSubmenu()
             menu.addItem(folderItem)
+        }
+    }
+
+    private func buildTodaySubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Today")
+
+        let calendar = CalendarBridge.shared
+        switch calendar.authorizationStatus {
+        case .notDetermined:
+            let item = NSMenuItem(title: "Grant Calendar access…",
+                                  action: #selector(grantCalendarAccess),
+                                  keyEquivalent: "")
+            item.target = self
+            sub.addItem(item)
+        case .denied, .restricted:
+            let item = NSMenuItem(title: "Calendar access denied — open System Settings",
+                                  action: #selector(openCalendarSettings),
+                                  keyEquivalent: "")
+            item.target = self
+            sub.addItem(item)
+        default:
+            break
+        }
+
+        guard calendar.isAuthorized else { return sub }
+
+        let events = calendar.todaysEvents()
+        if events.isEmpty {
+            let empty = NSMenuItem(title: "No events today", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            sub.addItem(empty)
+            return sub
+        }
+
+        let now = Date()
+        let timeFmt = DateFormatter()
+        timeFmt.dateFormat = "HH:mm"
+        for event in events {
+            let live = event.startDate <= now && event.endDate >= now
+            let prefix = live ? "● " : "  "
+            let title = "\(prefix)\(timeFmt.string(from: event.startDate))–\(timeFmt.string(from: event.endDate))  \(event.title)"
+            let item = NSMenuItem(title: title,
+                                  action: #selector(startMeetingForEvent(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = event.identifier
+            sub.addItem(item)
+        }
+
+        return sub
+    }
+
+    @objc private func grantCalendarAccess() {
+        Task { @MainActor in
+            let granted = await CalendarBridge.shared.requestAccess()
+            if !granted {
+                showError("Calendar access denied — enable it in System Settings → Privacy & Security → Calendar")
+            }
+        }
+    }
+
+    @objc private func openCalendarSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func startMeetingForEvent(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        // Look up the freshly-snapshotted event so we use today's actual data,
+        // not whatever was cached when the menu was built.
+        let event = CalendarBridge.shared.todaysEvents().first(where: { $0.identifier == id })
+        do {
+            try MeetingSession.shared.start(event: event)
+        } catch {
+            showError(error.localizedDescription)
         }
     }
 

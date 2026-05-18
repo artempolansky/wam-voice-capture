@@ -40,6 +40,7 @@ SWIFTC_ARGS=(
   "$ROOT/WAMVoiceCapture/MeetingSession.swift"
   "$ROOT/WAMVoiceCapture/SpeakerLabels.swift"
   "$ROOT/WAMVoiceCapture/RecordingsFolder.swift"
+  "$ROOT/WAMVoiceCapture/CalendarBridge.swift"
   "$ROOT/WAMVoiceCapture/AgentSyncTarget.swift"
   "$ROOT/WAMVoiceCapture/AgentSyncRegistry.swift"
   "$ROOT/WAMVoiceCapture/SystemAudioCapture.swift"
@@ -49,6 +50,7 @@ SWIFTC_ARGS=(
   -framework AVFoundation
   -framework CoreAudio
   -framework CoreMedia
+  -framework EventKit
   -framework ScreenCaptureKit
   -framework Security
   -framework UserNotifications
