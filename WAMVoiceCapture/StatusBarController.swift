@@ -197,106 +197,168 @@ final class StatusBarController: NSObject {
     private func buildMenu() -> NSMenu {
         let menu = NSMenu()
 
-        addMeetingMenuItems(to: menu)
-        menu.addItem(.separator())
-
-        let dgKey = NSMenuItem(
-            title: isDeepgramKeyPresent() ? "Deepgram API key… (set)" : "Deepgram API key…",
-            action: #selector(configureDeepgramKey),
-            keyEquivalent: ""
-        )
-        dgKey.target = self
-        menu.addItem(dgKey)
-
-        let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
-        micItem.submenu = buildMicSubmenu()
-        menu.addItem(micItem)
-
-        let lightItem = NSMenuItem(title: "Light", action: nil, keyEquivalent: "")
-        lightItem.submenu = buildLightSubmenu()
-        menu.addItem(lightItem)
-
-        let sendToItem = NSMenuItem(title: "Send to", action: nil, keyEquivalent: "")
-        sendToItem.submenu = buildSendToSubmenu()
-        menu.addItem(sendToItem)
-
-        if #available(macOS 13.0, *) {
+        if MeetingSession.shared.isRunning {
+            // Recording mode — focused menu with status header at top, only
+            // the actions relevant during a live meeting. Settings hidden.
+            addRecordingMeetingMenuItems(to: menu)
             menu.addItem(.separator())
-            let login = NSMenuItem(
-                title: "Запускать при входе в систему",
-                action: #selector(toggleLaunchAtLogin(_:)),
-                keyEquivalent: ""
-            )
-            login.target = self
-            login.state = LoginItemSettings.isLaunchAtLoginEnabled ? .on : .off
-            menu.addItem(login)
-        }
+            addQuitItem(to: menu)
+        } else {
+            // Idle mode — primary action first, then context-aware previews,
+            // then Settings (everything technical), then About/Quit, with a
+            // hotkey hint footer.
+            addIdleMeetingMenuItems(to: menu)
+            menu.addItem(.separator())
 
-        menu.addItem(.separator())
-        let quit = NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)),
+            let settings = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+            settings.submenu = buildSettingsSubmenu()
+            menu.addItem(settings)
+
+            menu.addItem(.separator())
+            let about = NSMenuItem(title: "About…",
+                                    action: #selector(showAboutDialog),
+                                    keyEquivalent: "")
+            about.target = self
+            menu.addItem(about)
+
+            addQuitItem(to: menu)
+            addHotkeyHint(to: menu)
+        }
+        return menu
+    }
+
+    private func addQuitItem(to menu: NSMenu) {
+        let quit = NSMenuItem(title: "Quit",
+                               action: #selector(NSApplication.terminate(_:)),
                                keyEquivalent: "q")
         menu.addItem(quit)
-        return menu
+    }
+
+    private func addHotkeyHint(to menu: NSMenu) {
+        let hint = NSMenuItem(title: "Tap right ⌥ for quick dictation",
+                              action: nil,
+                              keyEquivalent: "")
+        hint.isEnabled = false
+        menu.addItem(hint)
     }
 
     // MARK: - Meeting menu
 
-    private func addMeetingMenuItems(to menu: NSMenu) {
-        if MeetingSession.shared.isRunning {
-            let header = NSMenuItem(
-                title: "Meeting recording — \(formatElapsed(MeetingSession.shared.elapsedSeconds))",
-                action: nil,
-                keyEquivalent: ""
-            )
-            header.isEnabled = false
-            menu.addItem(header)
+    /// Recording-state menu: status header (elapsed + speakers + sync), then
+    /// the actions you actually need mid-meeting (open file, rename speaker,
+    /// stop). No settings — those are an idle-mode concern.
+    private func addRecordingMeetingMenuItems(to menu: NSMenu) {
+        let elapsed = formatElapsed(MeetingSession.shared.elapsedSeconds)
+        let header = NSMenuItem(title: "🔴 Meeting · \(elapsed)",
+                                action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        menu.addItem(header)
 
-            let stop = NSMenuItem(title: "Stop meeting",
-                                  action: #selector(stopMeeting),
-                                  keyEquivalent: "")
-            stop.target = self
-            menu.addItem(stop)
-
-            if MeetingSession.shared.transcriptURL != nil {
-                let open = NSMenuItem(title: "Open transcript…",
-                                      action: #selector(openMeetingTranscript),
-                                      keyEquivalent: "")
-                open.target = self
-                menu.addItem(open)
-            }
-
-            // Active speakers — one item per Speaker N (or custom name) with
-            // a Rename submenu. Empty until Deepgram emits at least one final
-            // result with words[].
-            let speakers = MeetingSession.shared.speakers.activeSpeakers()
-            if !speakers.isEmpty {
-                let renameRoot = NSMenuItem(title: "Rename speaker", action: nil, keyEquivalent: "")
-                let sub = NSMenu()
-                for s in speakers {
-                    let item = NSMenuItem(title: s.label,
-                                          action: #selector(renameSpeakerClicked(_:)),
-                                          keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = s.id
-                    sub.addItem(item)
-                }
-                renameRoot.submenu = sub
-                menu.addItem(renameRoot)
-            }
+        let speakers = MeetingSession.shared.speakers.activeSpeakers()
+        let speakerNote: String = {
+            if speakers.isEmpty { return "Waiting for first speech…" }
+            if speakers.count == 1 { return "\(speakers.count) speaker detected" }
+            return "\(speakers.count) speakers detected"
+        }()
+        let syncNote = primarySyncStatusLine()
+        let statusLine: String
+        if let syncNote {
+            statusLine = "   \(speakerNote) · \(syncNote)"
         } else {
-            let start = NSMenuItem(title: "Start meeting",
-                                   action: #selector(startMeeting),
-                                   keyEquivalent: "")
-            start.target = self
-            menu.addItem(start)
+            statusLine = "   \(speakerNote)"
+        }
+        let status = NSMenuItem(title: statusLine, action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(status)
 
-            let todayItem = NSMenuItem(title: "Today", action: nil, keyEquivalent: "")
-            todayItem.submenu = buildTodaySubmenu()
-            menu.addItem(todayItem)
+        menu.addItem(.separator())
 
-            let folderItem = NSMenuItem(title: "Recordings folder", action: nil, keyEquivalent: "")
-            folderItem.submenu = buildRecordingsFolderSubmenu()
-            menu.addItem(folderItem)
+        if MeetingSession.shared.transcriptURL != nil {
+            let open = NSMenuItem(title: "Open transcript",
+                                  action: #selector(openMeetingTranscript),
+                                  keyEquivalent: "")
+            open.target = self
+            menu.addItem(open)
+        }
+
+        if !speakers.isEmpty {
+            let renameRoot = NSMenuItem(title: "Rename speaker", action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            for s in speakers {
+                let item = NSMenuItem(title: s.label,
+                                      action: #selector(renameSpeakerClicked(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = s.id
+                sub.addItem(item)
+            }
+            renameRoot.submenu = sub
+            menu.addItem(renameRoot)
+        }
+
+        let stop = NSMenuItem(title: "Stop meeting",
+                              action: #selector(stopMeeting),
+                              keyEquivalent: "")
+        stop.target = self
+        menu.addItem(stop)
+    }
+
+    /// Idle-state primary actions: Start, Today (with event count inline),
+    /// Recordings folder (with current path inline). Everything technical
+    /// lives in the Settings submenu.
+    private func addIdleMeetingMenuItems(to menu: NSMenu) {
+        let start = NSMenuItem(title: "Start meeting",
+                               action: #selector(startMeeting),
+                               keyEquivalent: "")
+        start.target = self
+        menu.addItem(start)
+
+        let todayCount = CalendarBridge.shared.isAuthorized
+            ? CalendarBridge.shared.todaysEvents().count
+            : nil
+        let todayTitle: String
+        if let count = todayCount {
+            todayTitle = count == 0 ? "Today · no events" : "Today · \(count) event\(count == 1 ? "" : "s")"
+        } else {
+            todayTitle = "Today"
+        }
+        let todayItem = NSMenuItem(title: todayTitle, action: nil, keyEquivalent: "")
+        todayItem.submenu = buildTodaySubmenu()
+        menu.addItem(todayItem)
+
+        let folderItem = NSMenuItem(title: "Recordings · \(compactFolderLabel())",
+                                    action: nil, keyEquivalent: "")
+        folderItem.submenu = buildRecordingsFolderSubmenu()
+        menu.addItem(folderItem)
+    }
+
+    /// Short display string for the current recordings folder. Replaces the
+    /// user's home directory with ``~`` and caps total width so the menu
+    /// doesn't grow obnoxiously wide on long custom paths.
+    private func compactFolderLabel() -> String {
+        let url = RecordingsFolder.currentURL()
+        var path = url.path
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            path = "~" + String(path.dropFirst(home.count))
+        }
+        let maxLen = 40
+        if path.count > maxLen {
+            return "…" + String(path.suffix(maxLen - 1))
+        }
+        return path
+    }
+
+    /// Returns the first enabled sync target's status as a short line, or
+    /// nil if no targets are configured. Used in the recording header.
+    private func primarySyncStatusLine() -> String? {
+        let enabled = AgentSyncRegistry.shared.targets.filter { $0.enabled }
+        guard let target = enabled.first else { return nil }
+        switch target.status {
+        case .idle:                       return "syncing to \(target.name)"
+        case .syncing:                    return "syncing to \(target.name)…"
+        case .lastSucceeded:              return "✓ synced to \(target.name)"
+        case .lastFailed(_, let err):     return "⚠ \(target.name): \(err.prefix(40))"
         }
     }
 
@@ -636,6 +698,81 @@ final class StatusBarController: NSObject {
 
     private func isDeepgramKeyPresent() -> Bool {
         (try? KeychainHelper.deepgramAPIKey()).map { !$0.isEmpty } ?? false
+    }
+
+    // MARK: - Settings submenu (idle-mode only)
+
+    /// Collapses what used to be 4-5 top-level entries (Deepgram key, Mic,
+    /// Light, Send to, Launch at login) into one Settings submenu so the
+    /// idle menu stays focused on actions. Light auto-hides if not configured.
+    private func buildSettingsSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Settings")
+
+        let micItem = NSMenuItem(title: "Microphone", action: nil, keyEquivalent: "")
+        micItem.submenu = buildMicSubmenu()
+        sub.addItem(micItem)
+
+        let dgKey = NSMenuItem(
+            title: isDeepgramKeyPresent()
+                ? "Speech recognition (Deepgram) ✓"
+                : "Speech recognition (Deepgram)…",
+            action: #selector(configureDeepgramKey),
+            keyEquivalent: ""
+        )
+        dgKey.target = self
+        sub.addItem(dgKey)
+
+        let sendToItem = NSMenuItem(title: "Forward transcripts to",
+                                    action: nil, keyEquivalent: "")
+        sendToItem.submenu = buildSendToSubmenu()
+        sub.addItem(sendToItem)
+
+        // Light is a niche feature — auto-hide unless the user has set up a
+        // host. Reachable for first-time setup by opening the Lamp section
+        // in this submenu? No — too rare. They can edit personal_targets or
+        // re-add via a feature flag later.
+        if !LightControl.shared.host.isEmpty {
+            let lightItem = NSMenuItem(title: "Lamp indicator",
+                                       action: nil, keyEquivalent: "")
+            lightItem.submenu = buildLightSubmenu()
+            sub.addItem(lightItem)
+        }
+
+        if #available(macOS 13.0, *) {
+            sub.addItem(.separator())
+            let login = NSMenuItem(
+                title: "Start at login",
+                action: #selector(toggleLaunchAtLogin(_:)),
+                keyEquivalent: ""
+            )
+            login.target = self
+            login.state = LoginItemSettings.isLaunchAtLoginEnabled ? .on : .off
+            sub.addItem(login)
+        }
+
+        return sub
+    }
+
+    @objc private func showAboutDialog() {
+        let alert = NSAlert()
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build   = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        alert.messageText = "WAM Voice Capture"
+        alert.informativeText = """
+            Version \(version) (\(build))
+            MIT License · open source
+
+            Push-to-talk dictation + meeting recording with calendar-aware \
+            file naming and configurable sync to a remote agent inbox.
+
+            https://github.com/artempolansky/wam-voice-capture
+            """
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Open on GitHub")
+        if alert.runModal() == .alertSecondButtonReturn,
+           let url = URL(string: "https://github.com/artempolansky/wam-voice-capture") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     private func buildMicSubmenu() -> NSMenu {
