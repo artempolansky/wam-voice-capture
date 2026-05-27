@@ -94,8 +94,18 @@ final class AudioCapture {
     }
 
     private func handleConfigurationChange() {
+        // On-demand mode quirk: when we just stopped the engine, AVAudioEngine
+        // tears down its internal aggregate device. macOS fires
+        // AVAudioEngineConfigurationChange in response, which used to make us
+        // auto-restart the engine here — kicking the menubar mic indicator
+        // back on indefinitely. Now: only restart if the engine was running
+        // when the change arrived. A stopped engine STAYS stopped.
+        guard engine.isRunning else {
+            TrayLog.append("audio: configuration change ignored (engine idle in on-demand mode)")
+            return
+        }
         TrayLog.append("audio: configuration change — restarting engine")
-        if engine.isRunning { stopEngine() }
+        stopEngine()
         triedFallbacks.removeAll()
         do {
             try startEngine()
