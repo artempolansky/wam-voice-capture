@@ -13,30 +13,9 @@ import Foundation
 /// `sendAudio` buffers chunks while `connecting` and flushes them once
 /// `didOpenWithProtocol` arrives — the WebSocket handshake commonly takes
 /// 200–500 ms and previously dropped any audio that landed in that window.
-final class DeepgramClient: NSObject {
+final class DeepgramClient: NSObject, STTProvider {
 
-    /// One word from Deepgram's `alternatives[0].words[]` array. Populated only
-    /// when `diarize=true` is enabled. `speaker` is Deepgram's session-local
-    /// speaker ID (0, 1, 2, ...) within the channel — meaningless across
-    /// sessions or channels.
-    struct Word {
-        let text: String
-        let speaker: Int?
-        let start: Double
-        let end: Double
-    }
-
-    struct Transcript {
-        let text: String
-        let isFinal: Bool
-        /// Channel-index from Deepgram when `multichannel=true`. nil for mono.
-        let channelIndex: Int?
-        /// Per-word speaker assignments (when `diarize=true`). Empty if
-        /// diarization is off, or if this was an interim result with no words.
-        let words: [Word]
-    }
-
-    var onTranscript: ((Transcript) -> Void)?
+    var onTranscript: ((STTTranscript) -> Void)?
     var onError: ((Error) -> Void)?
     var onClose: ((Int, String) -> Void)?
     var onOpen: (() -> Void)?
@@ -314,7 +293,7 @@ final class DeepgramClient: NSObject {
             // Deepgram emits `words[]` only on final results — interims are
             // safe to ignore here; we'll still emit interim Transcripts with
             // empty words[] for any callers that watch them.
-            var words: [Word] = []
+            var words: [STTWord] = []
             if let rawWords = first["words"] as? [[String: Any]] {
                 words.reserveCapacity(rawWords.count)
                 for w in rawWords {
@@ -324,14 +303,14 @@ final class DeepgramClient: NSObject {
                     let speaker = w["speaker"] as? Int
                     let start = (w["start"] as? Double) ?? 0
                     let end = (w["end"] as? Double) ?? 0
-                    words.append(Word(text: wText, speaker: speaker, start: start, end: end))
+                    words.append(STTWord(text: wText, speaker: speaker, start: start, end: end))
                 }
             }
             if !text.isEmpty || isFinal {
-                onTranscript?(Transcript(text: text,
-                                         isFinal: isFinal,
-                                         channelIndex: channelIndex,
-                                         words: words))
+                onTranscript?(STTTranscript(text: text,
+                                            isFinal: isFinal,
+                                            channelIndex: channelIndex,
+                                            words: words))
             }
         }
     }
