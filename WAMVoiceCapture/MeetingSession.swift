@@ -60,10 +60,15 @@ final class MeetingSession {
     private var systemQueue = Data()
     private var mixerTimer: Timer?
 
-    // Deepgram
-    private var deepgram: DeepgramClient?
+    // STT provider (Deepgram or local Whisper)
+    private var stt: STTProvider?
     private var apiKey: String = ""
     private var reconnectAttempt = 0
+    /// Set in the provider's onClose callback. Polled by `stop()` so we
+    /// don't close the transcript file before the provider has had a chance
+    /// to emit final transcripts. Critical for batch providers like
+    /// Local Whisper where inference takes several seconds.
+    private var sttClosed = false
     private let maxReconnectDelay: TimeInterval = 30
     private var reconnectTask: Task<Void, Never>?
     private var stoppingDeliberately = false
@@ -107,6 +112,7 @@ final class MeetingSession {
         startedAt = Date()
         stoppingDeliberately = false
         reconnectAttempt = 0
+        sttClosed = false
         clearMixerBuffers()
         speakers.reset()
 
@@ -142,11 +148,22 @@ final class MeetingSession {
         }
         stopSystemAudio()
 
-        deepgram?.finish()
+        stt?.finish()
         Task { @MainActor [self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            self.deepgram?.disconnect()
-            self.deepgram = nil
+            // Wait for the provider to actually signal close — Deepgram does
+            // this within ~1 s of CloseStream, Local Whisper takes 2–15 s
+            // depending on recording length (batch inference). Before this
+            // change we hard-slept 1.5 s, which silently truncated Whisper
+            // transcripts on every meeting.
+            let deadline = Date().addingTimeInterval(30.0)
+            while !self.sttClosed, Date() < deadline {
+                try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
+            }
+            if !self.sttClosed {
+                TrayLog.append("meeting: \(STTSettings.shared.currentProvider.rawValue) close timeout — saving what we have")
+            }
+            self.stt?.disconnect()
+            self.stt = nil
             self.closeFile()
             self.isRunning = false
             // Final sync + .done marker on every enabled target. This happens
@@ -236,7 +253,7 @@ final class MeetingSession {
     }
 
     private func mixerTick() {
-        guard let dg = deepgram else { return }
+        guard let dg = stt else { return }
         mixerLock.lock()
         // Cap each queue at ~2s of audio so a stalled source can't grow
         // memory unbounded. We drop *oldest* samples to keep the live edge.
@@ -288,32 +305,33 @@ final class MeetingSession {
     }
 
     private func connectDeepgram() {
-        let dg = DeepgramClient(
+        let provider = STTSettings.shared.makeProvider(
             apiKey: apiKey,
             channels: 2,
             multichannel: true,
             diarize: true
         )
-        dg.onOpen = { [weak self] in
+        let label = STTSettings.shared.currentProvider.rawValue
+        provider.onOpen = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.reconnectAttempt = 0
-                TrayLog.append("meeting: deepgram WS opened (multichannel)")
+                TrayLog.append("meeting: \(label) opened (multichannel)")
             }
         }
-        dg.onTranscript = { [weak self] t in
+        provider.onTranscript = { [weak self] t in
             Task { @MainActor [weak self] in self?.handleTranscript(t) }
         }
-        dg.onError = { [weak self] err in
+        provider.onError = { [weak self] err in
             Task { @MainActor [weak self] in self?.handleError(err) }
         }
-        dg.onClose = { [weak self] code, reason in
+        provider.onClose = { [weak self] code, reason in
             Task { @MainActor [weak self] in self?.handleClose(code: code, reason: reason) }
         }
-        dg.connect()
-        deepgram = dg
+        provider.connect()
+        stt = provider
     }
 
-    private func handleTranscript(_ t: DeepgramClient.Transcript) {
+    private func handleTranscript(_ t: STTTranscript) {
         guard t.isFinal else { return }
         let channel = t.channelIndex ?? 0
 
@@ -368,7 +386,11 @@ final class MeetingSession {
         // server-side closes (code 1011 etc), and silently dropping it has
         // been hiding root causes when sockets die between meetings.
         let reasonNote = reason.isEmpty ? "" : " — \(reason)"
-        TrayLog.append("meeting: deepgram WS closed (code=\(code))\(reasonNote)")
+        TrayLog.append("meeting: \(STTSettings.shared.currentProvider.rawValue) closed (code=\(code))\(reasonNote)")
+        // Signal to `stop()`'s poll loop that the provider is done emitting
+        // transcripts. Critical for batch providers (Whisper) whose
+        // inference can take 5–15 s after `finish()`.
+        sttClosed = true
         guard isRunning, !stoppingDeliberately else { return }
         scheduleReconnect()
     }
@@ -383,7 +405,7 @@ final class MeetingSession {
             guard let self, !Task.isCancelled else { return }
             await MainActor.run { [weak self] in
                 guard let self, self.isRunning, !self.stoppingDeliberately else { return }
-                self.deepgram = nil
+                self.stt = nil
                 self.connectDeepgram()
             }
         }

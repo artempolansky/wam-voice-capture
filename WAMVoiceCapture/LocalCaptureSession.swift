@@ -37,7 +37,7 @@ final class LocalCaptureSession {
 
     // MARK: - State
 
-    private var deepgram: DeepgramClient?
+    private var stt: STTProvider?
     private var audioSubscription: AudioCapture.SubscriptionID?
     private var finalSegments: [String] = []
     private var lastInterim: String = ""
@@ -71,11 +71,11 @@ final class LocalCaptureSession {
 
         resetSessionState()
 
-        let dg = prepareDeepgram(apiKey: key)
-        dg.connect()
-        self.deepgram = dg
+        let provider = prepareSTT(apiKey: key)
+        provider.connect()
+        self.stt = provider
 
-        attachAudio(deepgram: dg, preRoll: preRoll)
+        attachAudio(stt: provider, preRoll: preRoll)
         armWatchdog()
 
         running = true
@@ -141,40 +141,44 @@ final class LocalCaptureSession {
         isStalled = false
     }
 
-    private func prepareDeepgram(apiKey: String) -> DeepgramClient {
-        let dg = DeepgramClient(apiKey: apiKey)
-        dg.onOpen = { [weak self] in
+    private func prepareSTT(apiKey: String) -> STTProvider {
+        let stt = STTSettings.shared.makeProvider(apiKey: apiKey,
+                                                  channels: 1,
+                                                  multichannel: false,
+                                                  diarize: false)
+        let providerLabel = STTSettings.shared.currentProvider.rawValue
+        stt.onOpen = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.deepgramOpened = true
-                TrayLog.append("local: deepgram WS opened")
+                TrayLog.append("local: \(providerLabel) opened")
             }
         }
-        dg.onTranscript = { [weak self] t in
+        stt.onTranscript = { [weak self] t in
             Task { @MainActor [weak self] in self?.handleTranscript(t) }
         }
-        dg.onError = { [weak self] err in
+        stt.onError = { [weak self] err in
             Task { @MainActor [weak self] in self?.handleDeepgramError(err) }
         }
-        dg.onClose = { [weak self] code, _ in
+        stt.onClose = { [weak self] code, _ in
             Task { @MainActor [weak self] in
                 self?.deepgramClosed = true
-                TrayLog.append("local: deepgram WS closed (code=\(code))")
+                TrayLog.append("local: \(providerLabel) closed (code=\(code))")
             }
         }
-        return dg
+        return stt
     }
 
-    /// Subscribes the live audio fanout to the Deepgram client and ships the
-    /// pre-roll snapshot. The subscription handler captures `dg` directly
+    /// Subscribes the live audio fanout to the STT provider and ships the
+    /// pre-roll snapshot. The subscription handler captures `stt` directly
     /// (not `self`) so it doesn't need to cross the MainActor boundary on the
     /// audio render thread.
-    private func attachAudio(deepgram dg: DeepgramClient, preRoll: Data) {
+    private func attachAudio(stt: STTProvider, preRoll: Data) {
         if !preRoll.isEmpty {
-            dg.sendAudio(preRoll)
+            stt.sendAudio(preRoll)
             TrayLog.append("local: pre-roll \(preRoll.count) bytes flushed")
         }
-        audioSubscription = AudioCapture.shared.subscribe { [weak dg] chunk in
-            dg?.sendAudio(chunk)
+        audioSubscription = AudioCapture.shared.subscribe { [weak stt] chunk in
+            stt?.sendAudio(chunk)
         }
     }
 
@@ -186,7 +190,7 @@ final class LocalCaptureSession {
 
     // MARK: - Event handlers
 
-    private func handleTranscript(_ t: DeepgramClient.Transcript) {
+    private func handleTranscript(_ t: STTTranscript) {
         transcriptsReceived += 1
         lastTranscriptAt = Date()
         if t.isFinal {
@@ -236,31 +240,31 @@ final class LocalCaptureSession {
     // MARK: - stop() helpers
 
     private func drainAndPaste() async {
-        let chunksAtStop = deepgram?.chunksSent ?? 0
-        let bytesAtStop  = deepgram?.bytesSent  ?? 0
-        TrayLog.append("local: stop — opened=\(deepgramOpened), chunks=\(chunksAtStop), bytes=\(bytesAtStop), transcripts=\(transcriptsReceived)")
+        let providerLabel = STTSettings.shared.currentProvider.rawValue
+        TrayLog.append("local: stop — provider=\(providerLabel), opened=\(deepgramOpened), transcripts=\(transcriptsReceived)")
 
-        // Post-roll: trailing audio still in the engine/converter/WS pipeline
-        // needs to land on Deepgram before we close the stream.
+        // Post-roll: trailing audio still in the engine pipeline needs to land
+        // on the provider before we close. Whisper-local also benefits — gives
+        // it a clean tail before batch inference.
         try? await Task.sleep(nanoseconds: UInt64(postRollSeconds * 1_000_000_000))
         if let sub = audioSubscription {
             AudioCapture.shared.unsubscribe(sub)
             audioSubscription = nil
         }
-        deepgram?.finish()  // CloseStream — server flushes finals then closes.
+        stt?.finish()  // streaming: CloseStream; batch: triggers inference
 
-        // Wait for the server to close — Deepgram only closes after all finals.
+        // Wait for the provider to close — Deepgram closes after flushing
+        // finals; Whisper-local closes when inference finishes.
         let deadline = Date().addingTimeInterval(deepgramFlushDeadline)
         while !deepgramClosed, Date() < deadline {
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         if !deepgramClosed {
-            let chunks = deepgram?.chunksSent ?? 0
-            TrayLog.append("local: deepgram close timeout — pasting what we have (opened=\(deepgramOpened), chunks=\(chunks), transcripts=\(transcriptsReceived))")
+            TrayLog.append("local: \(providerLabel) close timeout — pasting what we have (opened=\(deepgramOpened), transcripts=\(transcriptsReceived))")
         }
 
-        deepgram?.disconnect()
-        deepgram = nil
+        stt?.disconnect()
+        stt = nil
 
         var text = finalSegments.joined(separator: " ")
         if text.isEmpty { text = lastInterim }

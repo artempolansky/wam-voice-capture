@@ -712,15 +712,9 @@ final class StatusBarController: NSObject {
         micItem.submenu = buildMicSubmenu()
         sub.addItem(micItem)
 
-        let dgKey = NSMenuItem(
-            title: isDeepgramKeyPresent()
-                ? "Speech recognition (Deepgram) ✓"
-                : "Speech recognition (Deepgram)…",
-            action: #selector(configureDeepgramKey),
-            keyEquivalent: ""
-        )
-        dgKey.target = self
-        sub.addItem(dgKey)
+        let sttItem = NSMenuItem(title: "Speech recognition", action: nil, keyEquivalent: "")
+        sttItem.submenu = buildSpeechRecognitionSubmenu()
+        sub.addItem(sttItem)
 
         let sendToItem = NSMenuItem(title: "Forward transcripts to",
                                     action: nil, keyEquivalent: "")
@@ -751,6 +745,79 @@ final class StatusBarController: NSObject {
         }
 
         return sub
+    }
+
+    // MARK: - Speech recognition submenu
+
+    private func buildSpeechRecognitionSubmenu() -> NSMenu {
+        let sub = NSMenu(title: "Speech recognition")
+        let current = STTSettings.shared.currentProvider
+
+        // One menu item per provider, with the active one checked.
+        for provider in STTSettings.Provider.allCases {
+            let suffix = providerStatusSuffix(provider)
+            let item = NSMenuItem(
+                title: "\(provider.rawValue)\(suffix)",
+                action: #selector(switchSTTProvider(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.state = (provider == current) ? .on : .off
+            item.representedObject = provider.rawValue
+            sub.addItem(item)
+        }
+
+        sub.addItem(.separator())
+
+        // Provider-specific config sub-items.
+        let dgKey = NSMenuItem(
+            title: isDeepgramKeyPresent() ? "Deepgram API key…  (set)" : "Deepgram API key…",
+            action: #selector(configureDeepgramKey),
+            keyEquivalent: ""
+        )
+        dgKey.target = self
+        sub.addItem(dgKey)
+
+        // Whisper diagnostic row — tells the user what's missing for local mode.
+        let whisperStatus = whisperReadinessLine()
+        let whisperRow = NSMenuItem(title: whisperStatus, action: nil, keyEquivalent: "")
+        whisperRow.isEnabled = false
+        sub.addItem(whisperRow)
+
+        return sub
+    }
+
+    /// Trailing text for a provider menu item — flags missing prerequisites
+    /// (no API key for Deepgram, missing binary/model for Whisper) so the
+    /// user can see why an option is greyed out conceptually.
+    private func providerStatusSuffix(_ provider: STTSettings.Provider) -> String {
+        switch provider {
+        case .deepgram:
+            return isDeepgramKeyPresent() ? "" : "  (no API key)"
+        case .whisperLocal:
+            if !WhisperLocalClient.isInstalled { return "  (whisper-cli missing)" }
+            if !WhisperLocalClient.modelExists { return "  (no model file)" }
+            return ""
+        }
+    }
+
+    private func whisperReadinessLine() -> String {
+        if !WhisperLocalClient.isInstalled {
+            return "Local Whisper: install via `brew install whisper-cpp`"
+        }
+        if !WhisperLocalClient.modelExists {
+            return "Local Whisper: drop ggml-base.bin in ~/Library/.../models/"
+        }
+        let model = (WhisperLocalClient.modelPath as NSString).lastPathComponent
+        return "Local Whisper: ready (\(model))"
+    }
+
+    @objc private func switchSTTProvider(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let chosen = STTSettings.Provider(rawValue: raw) else { return }
+        if chosen == STTSettings.shared.currentProvider { return }
+        STTSettings.shared.currentProvider = chosen
+        // No menu refresh needed — the next click rebuilds it from scratch.
     }
 
     @objc private func showAboutDialog() {
