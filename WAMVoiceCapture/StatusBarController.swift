@@ -529,7 +529,7 @@ final class StatusBarController: NSObject {
 
     @objc private func startMeeting() {
         if trayState.recording {
-            showError("FN dictation in progress — release FN before starting a meeting")
+            showError("Dictation in progress — release the ⌥ key (right Option) before starting a meeting")
             return
         }
         do {
@@ -637,7 +637,7 @@ final class StatusBarController: NSObject {
             // but cannot swallow the event, so F5 would still trigger Chrome
             // refresh etc. Better to fail loudly and have the user fix
             // permissions than to silently mis-behave.
-            TrayLog.append("Hotkey: install failed — F5 will NOT work until Accessibility & Input Monitoring are granted in System Settings → Privacy & Security.")
+            TrayLog.append("Hotkey: install failed — right Option (⌥) tap-for-dictation will NOT work until Accessibility & Input Monitoring are granted in System Settings → Privacy & Security.")
         }
     }
 

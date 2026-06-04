@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-06-04
+
+Hotfix for v1.0.0 friends-beta — meetings with Local Whisper longer than ~30 seconds came back **empty** because the meeting finalization waited only 30 s for whisper-cli's batch inference, then closed the transcript file (and sent `.done`) before whisper had a chance to emit any segments. v1.0.0 has been re-marked as pre-release; everyone should upgrade.
+
+### Fixed
+- **Whisper meetings no longer produce empty transcripts** — `MeetingSession.stop()` now waits indefinitely for the STT provider to flush, instead of the previous hard 30 s deadline. Whisper batch inference time scales with recording length (≈1 s of audio per 0.1–0.3 s of inference on Apple Silicon, model-dependent); the old deadline was just long enough to look correct on dictation-length tests and silently truncated every real meeting.
+- The mic indicator and tray UI now go idle the **moment** the user clicks Stop, rather than waiting on inference — the meeting is over from the user's perspective immediately. A new `isFinalizing` state blocks the next `start()` until the previous session's transcript actually lands on disk; clicking Start during that window now shows a clear "Previous meeting is still being transcribed, please wait a few seconds." dialog instead of racing the old session's callbacks.
+- Tray log writes a `still transcribing (Ns elapsed)…` heartbeat every 10 s during long inference, so it's obvious whisper is alive (vs. hung).
+
+### Changed
+- Stale strings: hotkey-failure log now says "right Option (⌥) tap-for-dictation" instead of "F5"; meeting-blocked dialog says "release the ⌥ key (right Option)" instead of "release FN".
+
+### Known limitation (planned for v1.0.2)
+- Whisper still runs as a **single batch invocation** on the full meeting audio at stop time. For a one-hour meeting on a base model, that's ≈3–10 min of inference between Stop and the transcript landing on the agent. A future release will switch to **chunked inference during the meeting** so most of the audio is already transcribed by stop time.
+- Local dictation (push-to-talk) still has a 5 s flush deadline; on Whisper this can truncate long single dictations. Same fix as above but unfixed in v1.0.1 to keep the patch tight.
+
 ## [1.0.0] — 2026-06-04
 
 First public release (friends-beta). Everything below is the cumulative state of the app since the v1.0.0 baseline; see the closed PRs and earlier `[Unreleased]` entries for the per-phase breakdown.
