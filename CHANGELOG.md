@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-06-04
+
+First public release (friends-beta). Everything below is the cumulative state of the app since the v1.0.0 baseline; see the closed PRs and earlier `[Unreleased]` entries for the per-phase breakdown.
+
 ### Added
+- **App icon** — custom blue gradient with "wm" mark. `assets/Icon.icns` generated from a 1024×1024 source via `iconutil`, embedded as `CFBundleIconFile`.
+- **First-run UX** — when no speech recognition provider is configured, the tray menu shows a prominent **⚠ Setup needed** banner with a guided dialog that walks the user to either Deepgram setup or `brew install whisper-cpp` + model download.
+- **macOS 14+ startup check** — if the binary is somehow launched on an older OS, a clear alert appears (instead of silently crashing on EventKit APIs) and the app quits.
+- **Feedback shortcuts in tray** — "Send feedback (Telegram)" opens `t.me/weamclub`, "Report a bug (GitHub)" opens the Issues page. Also added as a third button in the About dialog.
+- **Update notifier (Phase 10)** — polls `api.github.com/repos/.../releases/latest` once per 24 h, posts a system notification when a newer tag is available. Click → release page in browser. Toggle in Settings; manual "Check for updates now" item.
+- **`docs/AGENT_PROTOCOL.md`** (closes #19) — full open protocol for third-party transcript watchers: inbox layout, file format, `.done` semantics, retry behavior, live-streaming option, 30-line example agent in Python.
+- **`PRIVACY.md`** — plain-English data flow: what stays local, what goes where (Deepgram, configured rsync targets, GitHub for update checks), what doesn't go anywhere.
+- **README.md** rewrite — step-by-step onboarding with Gatekeeper, all permissions, STT setup (Deepgram OR local whisper.cpp), troubleshooting, community links.
+- **GitHub Actions release pipeline** (`.github/workflows/release.yml`) — fires on `v*.*.*` tag push, builds .app, packs via `ditto` (preserves ad-hoc signature + extended attrs), creates GitHub Release with auto-generated install instructions and CHANGELOG section.
+
+### Changed
+- Whisper hallucination filter expanded: now suppresses common YouTube-subtitle reflexes ("Продолжение следует...", "Спасибо за просмотр", "Подписывайтесь на канал", "Thanks for watching", "Subtitles by Amara.org", `(piano music)`, `[applause]`, etc.) — these never enter the transcript even when whisper produces them on silence/pauses.
+- Dictation log now includes Deepgram's close `reason` (was: only the numeric code). Parity with the meeting log; helpful when diagnosing socket-not-connected flapping.
+- `CFBundleShortVersionString` → `1.0.0`, `CFBundleVersion` → `3`.
+
+### Added (earlier — recapping previous `[Unreleased]` entries from this cycle)
 - Phase 5: Calendar integration via EventKit (closes #6).
   - Tray menu **Today ▸** lists today's events (start–end + title), with `●` marking events live right now. Click an event to start a meeting tied to it.
   - On Start meeting, if a calendar event is active in the now ± 5 min window, the transcript file is auto-named with the event slug (`2026-05-18-143012-standup-with-anya.md` instead of `…-meeting.md`) and gets a YAML frontmatter header with title, date, start/end, attendees, conferencing URL (Zoom/Meet/Teams parsed from notes/url/location), calendar source, and `calendar_event_id`.
