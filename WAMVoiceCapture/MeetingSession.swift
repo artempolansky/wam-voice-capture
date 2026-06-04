@@ -23,20 +23,31 @@ final class MeetingSession {
     enum SessionError: LocalizedError {
         case missingAPIKey(String)
         case alreadyRunning
+        case finalizingPreviousMeeting
         case fileCreate(String)
         case systemAudio(String)
 
         var errorDescription: String? {
             switch self {
-            case .missingAPIKey(let s): return "Deepgram API key unavailable: \(s)"
-            case .alreadyRunning:       return "Meeting already in progress"
-            case .fileCreate(let s):    return "Failed to create transcript file: \(s)"
-            case .systemAudio(let s):   return "System audio capture failed: \(s)"
+            case .missingAPIKey(let s):         return "Deepgram API key unavailable: \(s)"
+            case .alreadyRunning:               return "Meeting already in progress"
+            case .finalizingPreviousMeeting:    return "Previous meeting is still being transcribed. Please wait a few seconds."
+            case .fileCreate(let s):            return "Failed to create transcript file: \(s)"
+            case .systemAudio(let s):           return "System audio capture failed: \(s)"
             }
         }
     }
 
     private(set) var isRunning = false
+    /// True between `stop()` returning to the UI and the STT provider actually
+    /// finishing inference + flushing the transcript to disk. Local Whisper is
+    /// batch-mode: a 5-minute meeting can take 30-60 s of single-shot
+    /// inference to transcribe. Mic capture and the meeting UI go idle the
+    /// moment the user clicks Stop (so the mic indicator disappears
+    /// immediately), but the next `start()` is blocked while finalization
+    /// runs — otherwise in-flight onTranscript callbacks would write into the
+    /// new meeting's file.
+    private(set) var isFinalizing = false
     private(set) var startedAt: Date?
     private(set) var transcriptURL: URL?
 
@@ -90,6 +101,11 @@ final class MeetingSession {
     /// for filename and YAML frontmatter.
     func start(event: CalendarBridge.Event? = nil) throws {
         guard !isRunning else { throw SessionError.alreadyRunning }
+        // Whisper batch inference from the *previous* meeting may still be
+        // running in the background. Starting now would re-bind `self.stt`
+        // and `self.fileHandle`, causing in-flight transcripts to write into
+        // the new meeting's file (or get dropped). Block until done.
+        guard !isFinalizing else { throw SessionError.finalizingPreviousMeeting }
 
         do {
             apiKey = try KeychainHelper.deepgramAPIKey()
@@ -148,37 +164,54 @@ final class MeetingSession {
         }
         stopSystemAudio()
 
+        // Begin STT finalization. For Deepgram this triggers a CloseStream
+        // round-trip (~1 s). For Local Whisper this kicks off the batch
+        // inference, which can take 5 s for a one-minute meeting up to
+        // several minutes for an hour-long one.
         stt?.finish()
+
+        // UI/audio cleanup happens **immediately** — the user's mental model
+        // is "I pressed stop, the meeting is over." The mic indicator must
+        // turn off now, the tray menu must go back to the idle state. We
+        // mark `isFinalizing = true` to gate the next `start()` call, so a
+        // user who clicks Start a second later gets a clean error rather
+        // than racing the previous meeting's onTranscript callbacks.
+        isRunning = false
+        isFinalizing = true
+        AudioCapture.shared.stop()
+        onStateChange?(false)
+        let provider = STTSettings.shared.currentProvider.rawValue
+        TrayLog.append("meeting: stopped (finalizing \(provider) transcript)")
+
         Task { @MainActor [self] in
-            // Wait for the provider to actually signal close — Deepgram does
-            // this within ~1 s of CloseStream, Local Whisper takes 2–15 s
-            // depending on recording length (batch inference). Before this
-            // change we hard-slept 1.5 s, which silently truncated Whisper
-            // transcripts on every meeting.
-            let deadline = Date().addingTimeInterval(30.0)
-            while !self.sttClosed, Date() < deadline {
-                try? await Task.sleep(nanoseconds: 100_000_000) // 100 ms
-            }
-            if !self.sttClosed {
-                TrayLog.append("meeting: \(STTSettings.shared.currentProvider.rawValue) close timeout — saving what we have")
+            // Wait for the provider to actually signal close. NO deadline —
+            // truncating a batch-mode transcript to 30 s of inference time
+            // would produce empty transcripts on real meetings (the failure
+            // mode we saw in v1.0.0 with three meetings in a row). Log
+            // progress every 10 s so the tray log shows us inference is
+            // still alive.
+            let waitStart = Date()
+            var lastTick = waitStart
+            while !self.sttClosed {
+                try? await Task.sleep(nanoseconds: 250_000_000)  // 250 ms
+                let now = Date()
+                if now.timeIntervalSince(lastTick) >= 10 {
+                    let elapsed = Int(now.timeIntervalSince(waitStart))
+                    TrayLog.append("meeting: \(provider) still transcribing (\(elapsed)s elapsed)…")
+                    lastTick = now
+                }
             }
             self.stt?.disconnect()
             self.stt = nil
             self.closeFile()
-            self.isRunning = false
             // Final sync + .done marker on every enabled target. This happens
             // AFTER closeFile() so the file on disk is fully flushed before
             // rsync runs.
             if let url = self.transcriptURL {
                 AgentSyncRegistry.shared.noteSessionEnded(file: url, kind: .meeting)
             }
-            // On-demand mic: stop the engine so the menubar indicator goes
-            // away. Note that AgentSyncRegistry.noteSessionEnded above is
-            // async — it kicks off the final rsync on a background queue.
-            // Stopping the audio engine doesn't interfere with rsync.
-            AudioCapture.shared.stop()
-            self.onStateChange?(false)
-            TrayLog.append("meeting: stopped")
+            self.isFinalizing = false
+            TrayLog.append("meeting: transcript finalized")
         }
     }
 
