@@ -1,0 +1,115 @@
+name: Release
+
+# Fires on a version tag (vX.Y.Z[-suffix]). Builds the .app, zips it
+# (preserving Resources/Icon.icns and Info.plist), and attaches the
+# zip to a freshly-created GitHub Release. The Release body links to
+# the changelog and reminds users of the right-click-Open Gatekeeper
+# step that ad-hoc-signed binaries require.
+#
+# The everyday CI workflow (build.yml) keeps building on every push
+# and PR; this workflow is purely the release-cut pipeline.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: macos-14
+    timeout-minutes: 20
+    permissions:
+      contents: write  # needed to create the GitHub Release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          swiftc --version
+
+      - name: Build .app
+        run: bash scripts/build-app.sh
+
+      - name: Verify bundle
+        run: |
+          test -d "WAM Voice Capture.app"
+          test -x "WAM Voice Capture.app/Contents/MacOS/WAMVoiceCapture"
+          test -f "WAM Voice Capture.app/Contents/Info.plist"
+          test -f "WAM Voice Capture.app/Contents/Resources/Icon.icns" \
+            || echo "WARN: Icon.icns missing — release will have generic icon"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier"   "WAM Voice Capture.app/Contents/Info.plist" | grep -q '^com\.artempolansky\.wam-voice-capture$'
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" "WAM Voice Capture.app/Contents/Info.plist" | grep -q '^14\.'
+
+      - name: Pack zip
+        id: pack
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          # Some shells render the tag as "v1.0.0", strip the leading v for
+          # the filename — matches Homebrew Cask convention.
+          VERSION="${TAG#v}"
+          ZIP="WAM-Voice-Capture-${VERSION}.zip"
+          # `ditto` preserves macOS extended attributes (incl. ad-hoc
+          # signature) better than plain `zip`. It also produces a flat zip
+          # with the .app at the top level — Finder unzips it cleanly.
+          ditto -c -k --sequesterRsrc --keepParent "WAM Voice Capture.app" "$ZIP"
+          echo "zip=$ZIP"     >> $GITHUB_OUTPUT
+          echo "tag=$TAG"     >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          ls -lh "$ZIP"
+          shasum -a 256 "$ZIP"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.pack.outputs.tag }}"
+          ZIP="${{ steps.pack.outputs.zip }}"
+          VERSION="${{ steps.pack.outputs.version }}"
+
+          # Pull the matching section out of CHANGELOG.md if present, else
+          # use a minimal default. Failures fall through gracefully so the
+          # release still goes out even if CHANGELOG drifts.
+          CHANGELOG_SECTION=$(
+            awk -v tag="$VERSION" '
+              /^## \[/ { in_section = ($0 ~ "\\["tag"\\]") ? 1 : 0; next }
+              in_section { print }
+            ' CHANGELOG.md 2>/dev/null | sed '/^$/N;/^\n$/D'
+          )
+
+          if [ -z "$CHANGELOG_SECTION" ]; then
+            CHANGELOG_SECTION="See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md) for details."
+          fi
+
+          NOTES=$(cat <<EOF
+          ## Install
+
+          1. Download \`${ZIP}\` below and unzip.
+          2. Drag **WAM Voice Capture.app** to \`/Applications/\`.
+          3. **First launch:** right-click the app → **Open** → confirm. (The app is ad-hoc signed; macOS Gatekeeper needs this one-time confirm.)
+          4. Open the tray menu and follow the **⚠ Setup needed** prompt to configure a speech recognition provider.
+
+          Full step-by-step in [README.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/README.md#setup-step-by-step).
+
+          ## What's new
+
+          ${CHANGELOG_SECTION}
+
+          ## Requirements
+
+          - macOS 14.0 (Sonoma) or later
+          - Apple Silicon recommended (binary is built for arm64)
+
+          ## Feedback
+
+          - Community chat: [@weamclub](https://t.me/weamclub)
+          - Bug reports: [GitHub Issues](https://github.com/${GITHUB_REPOSITORY}/issues)
+          EOF
+          )
+
+          gh release create "$TAG" \
+            --title "WAM Voice Capture $TAG" \
+            --notes "$NOTES" \
+            "$ZIP"

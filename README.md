@@ -1,115 +1,190 @@
 # WAM Voice Capture
 
-Menu-bar voice capture for macOS, with two modes:
+<p align="center">
+  <img src="assets/Icon.iconset/icon_256x256.png" width="128" alt="WAM Voice Capture icon">
+</p>
 
-- **Push-to-talk dictation** — tap the configured hotkey (default `fn`, configurable to F5 or any other key in [Phase 2](https://github.com/artempolansky/wam-voice-capture/issues/3)), speak, tap again; transcript pastes into the active window.
-- **Meeting recording** — start from the tray, mic + system audio go through Deepgram with multichannel diarization, transcript appended live to a Markdown file in `~/Documents/WAM Voice Capture Recordings/`.
+Menu-bar voice capture for macOS. Two modes, one tray icon:
 
-Audio never touches a server we control — only Deepgram (STT) and, optionally, your own Matter Lamp daemon. See [docs/SPEC.md](docs/SPEC.md) for the full product spec, decisions log, and phased plan.
+- **Push-to-talk dictation** — tap right `⌥` (Option), speak, tap again; transcript pastes into the active window.
+- **Meeting recording** — Start meeting from the tray; mic + system audio go through your chosen speech-to-text provider; transcript appended live to a Markdown file with YAML frontmatter (auto-populated from your Calendar event if any).
+
+Your speech can stay **fully on-device** via local whisper.cpp, or use Deepgram if you prefer streaming + diarization. Optional file-sync to your own server lets a downstream agent process transcripts (see [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md)).
+
+> **Status:** v1.0.0 — friends-beta. Expect rough edges; please report them in the [community chat](https://t.me/weamclub) or [GitHub issues](https://github.com/artempolansky/wam-voice-capture/issues).
+
+---
 
 ## Requirements
 
-- macOS 14+ (Sonoma) — required for Apple AEC (`voiceProcessingEnabled`)
-- Apple Silicon or Intel Mac
-- Deepgram API key — get one at [deepgram.com](https://deepgram.com)
-- (Optional, for legacy Telegram delivery) Homebrew + `brew install tdlib` and a Telegram `api_id`/`api_hash` from [my.telegram.org](https://my.telegram.org). Being replaced with the simpler Bot API in [Phase 7](https://github.com/artempolansky/wam-voice-capture/issues/8).
+- macOS **14.0 (Sonoma) or later** — required for `AVAudioEngine` voice processing
+- **Apple Silicon** Mac (M1 and newer). Intel builds are not produced by CI; you can build from source on Intel but performance with whisper.cpp will be slower.
+- One of:
+  - **Deepgram API key** — fast streaming + diarization, requires network. Free tier covers hours of meetings; sign up at [deepgram.com](https://deepgram.com).
+  - **Local whisper.cpp** — fully offline, runs on Apple Silicon GPU via Metal. Slightly slower (1–3 s after Stop), no diarization within a channel, but no network and no API key.
 
-## First run
+---
 
-1. Build & install:
+## <a name="setup"></a>Setup (step by step)
+
+### 1. Download
+
+Grab the latest **`WAM Voice Capture.app.zip`** from [Releases](https://github.com/artempolansky/wam-voice-capture/releases/latest).
+
+Unzip, drag `WAM Voice Capture.app` into `/Applications/`.
+
+### 2. First launch — Gatekeeper
+
+The app is ad-hoc signed (no Apple Developer Program yet — coming in a future release). macOS will refuse to open it from a normal double-click on first run. Workaround:
+
+1. **Right-click** (or Ctrl-click) `WAM Voice Capture.app` in Finder
+2. Choose **Open**
+3. macOS shows a warning dialog — click **Open** again
+4. The app is now permanently trusted on this Mac
+
+You'll see a small icon appear in your menu bar (top-right). That's the tray.
+
+### 3. Grant permissions
+
+Click the tray icon. macOS will ask for permission as you use each feature, but you can pre-grant in **System Settings → Privacy & Security**:
+
+| Permission | Required for | Where |
+|---|---|---|
+| **Microphone** | Any recording at all | Privacy & Security → Microphone |
+| **Accessibility** | Right-Option global hotkey | Privacy & Security → Accessibility |
+| **Input Monitoring** | Right-Option global hotkey | Privacy & Security → Input Monitoring |
+| **Calendar** *(optional)* | Auto-naming + Today menu | Privacy & Security → Calendar |
+| **Screen Recording** *(optional)* | System audio in meetings | Privacy & Security → Screen Recording |
+
+For each, click `+` and choose `/Applications/WAM Voice Capture.app` if it's not already listed. Toggle ON.
+
+### 4. Pick a speech recognition provider
+
+If you launch the app with no provider configured, the tray menu shows **⚠ Setup needed — choose a Speech recognition provider**. Click it for a guided dialog.
+
+**Option A — Deepgram (recommended for first-time users):**
+1. Sign up at [console.deepgram.com](https://console.deepgram.com) (free tier, no credit card needed for ~1000 hours)
+2. Create an API key
+3. Tray → **Settings → Speech recognition → Deepgram API key…**
+4. Paste the key, hit Save
+
+**Option B — Local whisper.cpp (fully offline):**
+1. Install the binary:
    ```bash
-   bash scripts/install.sh
+   brew install whisper-cpp
    ```
-   The script downloads tdlib via Homebrew if missing, builds `WAM Voice Capture.app`, copies it to `/Applications/`, and launches.
+2. Download a model into `~/Library/Application Support/WAM Voice Capture/models/`:
+   ```bash
+   mkdir -p ~/Library/Application\ Support/WAM\ Voice\ Capture/models
+   cd ~/Library/Application\ Support/WAM\ Voice\ Capture/models
+   # base = 142 MB, fast on M-series, OK quality:
+   curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+   # OR small = 466 MB, noticeably better Russian/English:
+   curl -L -O https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin
+   ```
+3. Tray → **Settings → Speech recognition → Local Whisper**
 
-2. Grant permissions when macOS asks:
-   - **Microphone** — required for any capture
-   - **Accessibility** — required for the global hotkey
-   - **Screen Recording** — required only for the **Meeting recording** mode (system audio capture)
-   - **Calendar** — for auto-naming meeting transcripts and Today's events in the menu (Phase 5)
+The bottom of the Speech recognition submenu shows readiness — `Local Whisper: ready (ggml-small.bin)` once both binary and model are in place.
 
-3. Open the tray menu (top-right of the menu bar) and click **Deepgram API key…** to save your key. It's stored in your login Keychain.
+### 5. Use it
 
-That's the full first-run setup.
+**Dictation** — tap **right Option** (⌥), speak, tap again. Text pastes into whatever app has focus.
 
-## Upgrading from VoiceMax 1.0.0
-
-If you previously ran VoiceMax 1.0.0 on this Mac, the new build migrates your state automatically on first launch:
-
-- **Deepgram API key** — copied forward from `voicemax.deepgram.api_key` in Keychain (no re-entry)
-- **Application Support data** (TDLib session, logs) — moved from `~/Library/Application Support/VoiceMax/` to `~/Library/Application Support/WAM Voice Capture/`
-- **UserDefaults settings** (mic device, Matter Lamp config) — copied forward
-
-**Old transcripts** in `~/Documents/VoiceMax-Recordings/` are **not** moved — keep them where they are or move them yourself. New recordings land in `~/Documents/WAM Voice Capture Recordings/`.
-
-You can uninstall the old VoiceMax 1.0.0 at any time after the new build runs once:
-
-```bash
-rm -rf /Applications/VoiceMax.app
-```
-
-## Usage
-
-**Dictation:** tap the hotkey, speak, tap again. Transcript pastes into the focused window. The post-roll buffer keeps the last words; the pre-roll buffer captures up to 1.5 s of speech *before* you press the hotkey.
-
-**Meeting recording:** open the tray menu and click **Start meeting**. The transcript file appears at `~/Documents/WAM Voice Capture Recordings/YYYY-MM-DD-HHMM-meeting.md`. Live-tail it:
+**Meeting** — tray → **Start meeting**. Speak. **Stop meeting** when done. Transcript lands in `~/Documents/WAM Voice Capture Recordings/`. Live-tail it:
 
 ```bash
 tail -f "$(ls -t ~/Documents/WAM\ Voice\ Capture\ Recordings/*.md | head -1)"
 ```
 
-By default only **system audio** is recorded into `[Others]`. To inject your own words into `[Me]`, **hold the hotkey while talking**. Release to close the gate. Click **Stop meeting** when done.
+---
 
-> **Note:** [Phase 4](https://github.com/artempolansky/wam-voice-capture/issues/5) replaces this hold-to-talk gate with always-on dual-channel recording, diarized speakers (`Speaker 1` for mic, `Speaker 2/3/...` for system audio), and Apple AEC for echo suppression on speakers.
+## Optional: forward transcripts to an agent
 
-## Optional: Matter Lamp integration
+WAM Voice Capture can rsync each meeting transcript to a folder on your own server, where any agent (your own scripts, [Angelina](https://github.com/artempolansky/angelina-ops), etc.) can process it. See [docs/AGENT_PROTOCOL.md](docs/AGENT_PROTOCOL.md) for the file layout and lifecycle contract.
 
-If you run a Matter Lamp HTTP daemon (or compatible — `GET /mode/<color>`), WAM Voice Capture can drive it as a recording indicator: red while recording, breathing-blue while idle, breathing-warm-white while the mic is offline.
+Tray → **Settings → Forward transcripts to → Add target…**
 
-Enable in tray → **Light → Configure host…**, then toggle **Enabled**. Disabled by default.
+---
 
-## Updating
+## Optional: Matter Lamp indicator
 
+If you run a Matter Lamp HTTP daemon (or compatible — `GET /mode/<color>`), the app can drive it as a recording indicator: red while recording, breathing-blue while idle, breathing-warm-white while the mic is offline.
+
+Tray → **Settings → Lamp indicator → Configure host…** (only appears once you set a host once).
+
+---
+
+## Updates
+
+The app checks GitHub Releases once a day and posts a system notification if a newer version is available. Clicking the notification opens the release page in your browser — download the new `.zip` and replace the app in `/Applications/`. No auto-install (would require Developer ID signing).
+
+Toggle via tray → **Settings → Check for updates automatically**.
+
+---
+
+## Troubleshooting
+
+**Tray menu says "⚠ Setup needed"** — no speech provider configured. Follow [step 4](#4-pick-a-speech-recognition-provider) above.
+
+**Right Option doesn't trigger dictation** — the global hotkey needs Accessibility + Input Monitoring permissions. The log will say `Hotkey: CGEvent.tapCreate failed`. See step 3.
+
+**App can't be opened, says "damaged"** — quarantine attribute. From Terminal:
 ```bash
-cd ~/wam-voice-capture && git pull && bash scripts/install.sh
+xattr -cr "/Applications/WAM Voice Capture.app"
+```
+Then right-click → Open as in step 2.
+
+**Local Whisper transcribes Russian as French gibberish** — make sure you're not running the `tiny` model; download `base` or `small` (see step 4 option B).
+
+**Meeting transcript empty / "Whisper" header only** — STT close timeout. Check the log:
+```bash
+tail -50 ~/Library/Application\ Support/WAM\ Voice\ Capture/wam-voice-capture-tray.txt
 ```
 
-(Auto-update notifier with GitHub Releases poll arrives in [Phase 10](https://github.com/artempolansky/wam-voice-capture/issues/11).)
-
-## Logs
-
-Plain-text log of every session boundary, error, and diagnostic:
-
+**Where are my logs?**
 ```bash
 tail -f ~/Library/Application\ Support/WAM\ Voice\ Capture/wam-voice-capture-tray.txt
 ```
+Or via Console.app filtered by subsystem `com.artempolansky.wam-voice-capture`.
 
-Or via the system log stream:
-
-```bash
-log stream --predicate 'subsystem == "com.artempolansky.wam-voice-capture"' --level debug
-```
+---
 
 ## Architecture
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the legacy view and [docs/SPEC.md](docs/SPEC.md) for the target architecture.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the original sketch and [docs/SPEC.md](docs/SPEC.md) for the current spec + phased plan.
 
 Key components:
 
-- `AudioCapture` — always-on AVAudioEngine input tap, 16 kHz Int16 mono, 1.5 s pre-roll ring, 50 Hz fanout to subscribers
-- `SystemAudioCapture` — ScreenCaptureKit `SCStream` capturing system audio output, same 16 kHz format
-- `DeepgramClient` — WebSocket to `wss://api.deepgram.com/v1/listen`, state machine with pending-queue buffering during handshake, single- and multi-channel modes
-- `LocalCaptureSession` — hotkey-press dictation lifecycle, watchdog, paste delivery
-- `MeetingSession` — long-running stereo merge (mic = L, system = R) → Deepgram with `multichannel=true`, live-append transcript with channel labels
-- `LightControl` — fire-and-forget HTTP to the lamp daemon, circuit breaker on failures
-- `Migration` — one-shot legacy-layout migration from VoiceMax 1.0.0
-- `TelegramClient` — TDLib auth flow (phone/code/2FA + session storage); topic-mode delivery is not yet wired into the dictation flow. Replaced with Telegram Bot API in [Phase 7](https://github.com/artempolansky/wam-voice-capture/issues/8).
+- `AudioCapture` — on-demand AVAudioEngine input tap; 16 kHz Int16 mono; ring-buffer pre-roll
+- `SystemAudioCapture` — ScreenCaptureKit `SCStream`, 16 kHz format
+- `STTProvider` protocol with two implementations:
+  - `DeepgramClient` — WebSocket streaming + diarization
+  - `WhisperLocalClient` — whisper.cpp CLI subprocess, batch inference
+- `CalendarBridge` — EventKit wrapper for Today menu + auto-naming
+- `AgentSyncRegistry` / `AgentSyncTarget` — rsync-over-SSH delivery to a remote inbox
+- `MeetingSession` / `LocalCaptureSession` — orchestrate audio → STT → file/paste
+- `UpdateNotifier` — GitHub Releases poll, system notification on new tag
 
-No server. Audio leaves the machine only when bound for Deepgram (STT) or, optionally, the lamp daemon on your local network.
+No server we control. Audio leaves the machine only to your chosen STT provider (Deepgram or none if Whisper-local) and optionally to your own configured rsync targets.
+
+---
+
+## Privacy
+
+See [PRIVACY.md](PRIVACY.md). Short version: no telemetry, no analytics, no remote control.
+
+---
+
+## Community
+
+- **Feedback / questions / ideas** — [t.me/weamclub](https://t.me/weamclub)
+- **Bug reports** — [GitHub Issues](https://github.com/artempolansky/wam-voice-capture/issues)
+
+---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The full plan is in [docs/SPEC.md](docs/SPEC.md), and each phase has its own [GitHub issue](https://github.com/artempolansky/wam-voice-capture/issues).
+See [CONTRIBUTING.md](CONTRIBUTING.md). Full plan in [docs/SPEC.md](docs/SPEC.md).
 
 ## License
 

@@ -215,6 +215,18 @@ final class StatusBarController: NSObject {
             menu.addItem(settings)
 
             menu.addItem(.separator())
+            let feedback = NSMenuItem(title: "Send feedback (Telegram)",
+                                       action: #selector(openFeedbackChat),
+                                       keyEquivalent: "")
+            feedback.target = self
+            menu.addItem(feedback)
+
+            let bug = NSMenuItem(title: "Report a bug (GitHub)",
+                                  action: #selector(openBugReport),
+                                  keyEquivalent: "")
+            bug.target = self
+            menu.addItem(bug)
+
             let about = NSMenuItem(title: "About…",
                                     action: #selector(showAboutDialog),
                                     keyEquivalent: "")
@@ -307,6 +319,19 @@ final class StatusBarController: NSObject {
     /// Recordings folder (with current path inline). Everything technical
     /// lives in the Settings submenu.
     private func addIdleMeetingMenuItems(to menu: NSMenu) {
+        // First-run nudge: if neither STT provider is configured, the app
+        // can't actually do anything yet. Surface that up front, otherwise
+        // the user clicks Start meeting and gets a silent or confusing
+        // failure. Once any provider is ready, this hint disappears.
+        if !STTSettings.shared.currentProviderReady {
+            let banner = NSMenuItem(title: "⚠ Setup needed — choose a Speech recognition provider",
+                                    action: #selector(jumpToSpeechRecognition),
+                                    keyEquivalent: "")
+            banner.target = self
+            menu.addItem(banner)
+            menu.addItem(.separator())
+        }
+
         let start = NSMenuItem(title: "Start meeting",
                                action: #selector(startMeeting),
                                keyEquivalent: "")
@@ -744,7 +769,30 @@ final class StatusBarController: NSObject {
             sub.addItem(login)
         }
 
+        // Updates
+        sub.addItem(.separator())
+        let autoCheck = NSMenuItem(title: "Check for updates automatically",
+                                    action: #selector(toggleUpdateAutoCheck(_:)),
+                                    keyEquivalent: "")
+        autoCheck.target = self
+        autoCheck.state = UpdateNotifier.shared.isEnabled ? .on : .off
+        sub.addItem(autoCheck)
+
+        let checkNow = NSMenuItem(title: "Check for updates now",
+                                   action: #selector(checkForUpdatesNow),
+                                   keyEquivalent: "")
+        checkNow.target = self
+        sub.addItem(checkNow)
+
         return sub
+    }
+
+    @objc private func toggleUpdateAutoCheck(_ sender: NSMenuItem) {
+        UpdateNotifier.shared.isEnabled.toggle()
+    }
+
+    @objc private func checkForUpdatesNow() {
+        UpdateNotifier.shared.checkNow()
     }
 
     // MARK: - Speech recognition submenu
@@ -812,6 +860,35 @@ final class StatusBarController: NSObject {
         return "Local Whisper: ready (\(model))"
     }
 
+    /// Convenience for the "⚠ Setup needed" first-run banner: brings up an
+    /// NSAlert explaining what's missing + a deep-link to System Settings
+    /// if Whisper needs install. Cheaper than rendering a real settings
+    /// window for v1.0.0-public.
+    @objc private func jumpToSpeechRecognition() {
+        let alert = NSAlert()
+        alert.messageText = "Set up speech recognition"
+        alert.informativeText = """
+            WAM Voice Capture needs one of two providers configured before \
+            it can transcribe anything.
+
+            • Deepgram (cloud): get an API key from console.deepgram.com, \
+            then click Settings → Speech recognition → Deepgram API key…
+
+            • Local Whisper (offline): run `brew install whisper-cpp`, \
+            then drop ggml-base.bin or larger into:
+            ~/Library/Application Support/WAM Voice Capture/models/
+
+            See README.md for step-by-step instructions.
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open setup guide")
+        alert.addButton(withTitle: "Close")
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "https://github.com/artempolansky/wam-voice-capture#setup") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     @objc private func switchSTTProvider(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String,
               let chosen = STTSettings.Provider(rawValue: raw) else { return }
@@ -832,12 +909,34 @@ final class StatusBarController: NSObject {
             Push-to-talk dictation + meeting recording with calendar-aware \
             file naming and configurable sync to a remote agent inbox.
 
-            https://github.com/artempolansky/wam-voice-capture
+            Code: github.com/artempolansky/wam-voice-capture
+            Feedback: t.me/weamclub
             """
         alert.addButton(withTitle: "OK")
         alert.addButton(withTitle: "Open on GitHub")
-        if alert.runModal() == .alertSecondButtonReturn,
-           let url = URL(string: "https://github.com/artempolansky/wam-voice-capture") {
+        alert.addButton(withTitle: "Telegram community")
+        switch alert.runModal() {
+        case .alertSecondButtonReturn:
+            if let url = URL(string: "https://github.com/artempolansky/wam-voice-capture") {
+                NSWorkspace.shared.open(url)
+            }
+        case .alertThirdButtonReturn:
+            if let url = URL(string: "https://t.me/weamclub") {
+                NSWorkspace.shared.open(url)
+            }
+        default:
+            break
+        }
+    }
+
+    @objc private func openFeedbackChat() {
+        if let url = URL(string: "https://t.me/weamclub") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func openBugReport() {
+        if let url = URL(string: "https://github.com/artempolansky/wam-voice-capture/issues/new") {
             NSWorkspace.shared.open(url)
         }
     }

@@ -14,8 +14,15 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/Resources"
 cp "$ROOT/Bundle/Info.plist" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+# App icon — built from assets/Icon.iconset/ once via iconutil (committed
+# as assets/Icon.icns so CI builds don't need iconutil).
+if [[ -f "$ROOT/assets/Icon.icns" ]]; then
+  cp "$ROOT/assets/Icon.icns" "$APP/Contents/Resources/Icon.icns"
+fi
 
 # TDLib was retired in favor of file-sync (Phase 7a / AgentSyncTarget). The
 # ~30 MB libtdjson.dylib, the Bridging header, and the Homebrew dependency
@@ -46,6 +53,7 @@ SWIFTC_ARGS=(
   "$ROOT/WAMVoiceCapture/CalendarBridge.swift"
   "$ROOT/WAMVoiceCapture/AgentSyncTarget.swift"
   "$ROOT/WAMVoiceCapture/AgentSyncRegistry.swift"
+  "$ROOT/WAMVoiceCapture/UpdateNotifier.swift"
   "$ROOT/WAMVoiceCapture/SystemAudioCapture.swift"
   "$ROOT/WAMVoiceCapture/LightControl.swift"
   -o "$APP/Contents/MacOS/$BIN_NAME"

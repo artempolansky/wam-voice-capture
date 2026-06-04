@@ -356,7 +356,61 @@ final class WhisperLocalClient: NSObject, STTProvider {
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
+
+        // Filter known whisper hallucinations on silence / pauses. The
+        // model was trained on YouTube subtitles and reflexively inserts
+        // these phrases at the end of audio or during quiet stretches —
+        // they are NOT what the user said and must not enter the transcript.
+        if isHallucinationPhrase(collapsed) {
+            return ""
+        }
         return collapsed
+    }
+
+    /// Lowercased phrases that whisper-cli regularly hallucinates from
+    /// nothing. We match the trimmed lowercased candidate against this set
+    /// exactly (after stripping trailing dots/dashes), so legitimate text
+    /// that just happens to contain a fragment is not dropped.
+    private static let hallucinationPhrases: Set<String> = [
+        // Russian YouTube subtitle reflexes — by far the most common,
+        // produced on near-silence or as a "graceful close" by smaller models.
+        "продолжение следует",
+        "продолжение следует в следующей серии",
+        "спасибо за просмотр",
+        "спасибо за внимание",
+        "подписывайтесь на канал",
+        "подписывайся на канал",
+        "ставьте лайки",
+        "субтитры подготовил",
+        "субтитры сделал",
+        // English equivalents
+        "thanks for watching",
+        "thank you for watching",
+        "like and subscribe",
+        "subscribe to my channel",
+        "subtitles by the amara.org community",
+        "subtitles by amara.org",
+        // Caption-style noise tokens
+        "(piano music)",
+        "(applause)",
+        "(music)",
+        "(silence)",
+        "[music]",
+        "[applause]",
+        "[silence]",
+        "...",
+        "…",
+    ]
+
+    private static func isHallucinationPhrase(_ text: String) -> Bool {
+        // Trim leading/trailing whitespace + a few terminal punctuation
+        // characters so "Продолжение следует..." matches as well as
+        // "продолжение следует !".
+        let punctuation = CharacterSet(charactersIn: ".!?…-—:; ")
+        let candidate = text
+            .lowercased()
+            .trimmingCharacters(in: punctuation.union(.whitespacesAndNewlines))
+        return hallucinationPhrases.contains(candidate)
     }
 
     // MARK: - Errors

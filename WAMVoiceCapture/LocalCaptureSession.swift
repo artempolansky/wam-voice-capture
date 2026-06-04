@@ -159,10 +159,15 @@ final class LocalCaptureSession {
         stt.onError = { [weak self] err in
             Task { @MainActor [weak self] in self?.handleDeepgramError(err) }
         }
-        stt.onClose = { [weak self] code, _ in
+        stt.onClose = { [weak self] code, reason in
             Task { @MainActor [weak self] in
                 self?.deepgramClosed = true
-                TrayLog.append("local: \(providerLabel) closed (code=\(code))")
+                // Reason is Deepgram's server-side close message — e.g.
+                // "Deepgram did not receive audio data or a text message
+                // within the timeout window". Logging it for parity with
+                // MeetingSession; previously only the code was visible.
+                let suffix = reason.isEmpty ? "" : " — \(reason)"
+                TrayLog.append("local: \(providerLabel) closed (code=\(code))\(suffix)")
             }
         }
         return stt
