@@ -215,17 +215,34 @@ final class StatusBarController: NSObject {
             menu.addItem(settings)
 
             menu.addItem(.separator())
-            let feedback = NSMenuItem(title: "Send feedback (Telegram)",
-                                       action: #selector(openFeedbackChat),
-                                       keyEquivalent: "")
-            feedback.target = self
-            menu.addItem(feedback)
 
-            let bug = NSMenuItem(title: "Report a bug (GitHub)",
-                                  action: #selector(openBugReport),
-                                  keyEquivalent: "")
-            bug.target = self
-            menu.addItem(bug)
+            // Single "Feedback ▸" entry hosting both Telegram (community chat,
+            // default channel for friends) and GitHub Issues (technical bug
+            // reports). Replaces two top-level items; reduces tray clutter.
+            let feedbackRoot = NSMenuItem(title: "Feedback", action: nil, keyEquivalent: "")
+            let feedbackSub = NSMenu(title: "Feedback")
+            let feedbackTg = NSMenuItem(title: "Send feedback (Telegram)",
+                                         action: #selector(openFeedbackChat),
+                                         keyEquivalent: "")
+            feedbackTg.target = self
+            feedbackSub.addItem(feedbackTg)
+
+            let feedbackBug = NSMenuItem(title: "Report a bug (GitHub)",
+                                          action: #selector(openBugReport),
+                                          keyEquivalent: "")
+            feedbackBug.target = self
+            feedbackSub.addItem(feedbackBug)
+
+            feedbackSub.addItem(.separator())
+
+            let feedbackChat = NSMenuItem(title: "Open community chat (@weamclub)",
+                                           action: #selector(openFeedbackChat),
+                                           keyEquivalent: "")
+            feedbackChat.target = self
+            feedbackSub.addItem(feedbackChat)
+
+            feedbackRoot.submenu = feedbackSub
+            menu.addItem(feedbackRoot)
 
             let about = NSMenuItem(title: "About…",
                                     action: #selector(showAboutDialog),
