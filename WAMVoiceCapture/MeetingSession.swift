@@ -184,15 +184,24 @@ final class MeetingSession {
         TrayLog.append("meeting: stopped (finalizing \(provider) transcript)")
 
         Task { @MainActor [self] in
-            // Wait for the provider to actually signal close. NO deadline —
-            // truncating a batch-mode transcript to 30 s of inference time
-            // would produce empty transcripts on real meetings (the failure
-            // mode we saw in v1.0.0 with three meetings in a row). Log
-            // progress every 10 s so the tray log shows us inference is
-            // still alive.
+            // Wait for the provider to actually signal close. v1.0.1 removed
+            // the previous hard 30 s deadline because batch-mode Whisper
+            // legitimately takes minutes for a long meeting; truncating
+            // there produced empty transcripts. v1.0.2 adds a much more
+            // generous 10-minute upper bound as a safety net for cases
+            // where neither `onClose` nor the `handleError`-driven
+            // sttClosed-flip ever fires (process hang, kernel panic in
+            // whisper-cli, network-layer error not surfaced through
+            // delegate, etc.). Without it the meeting stays in
+            // `isFinalizing` state forever and blocks every subsequent
+            // `start()` call — the 11:03 outage we hit in 1.0.1.
+            //
+            // Log progress every 10 s so the tray log shows inference is
+            // still alive (vs. hung).
             let waitStart = Date()
+            let waitDeadline = waitStart.addingTimeInterval(600)  // 10 min hard ceiling
             var lastTick = waitStart
-            while !self.sttClosed {
+            while !self.sttClosed, Date() < waitDeadline {
                 try? await Task.sleep(nanoseconds: 250_000_000)  // 250 ms
                 let now = Date()
                 if now.timeIntervalSince(lastTick) >= 10 {
@@ -200,6 +209,16 @@ final class MeetingSession {
                     TrayLog.append("meeting: \(provider) still transcribing (\(elapsed)s elapsed)…")
                     lastTick = now
                 }
+            }
+            if !self.sttClosed {
+                // Safety-net timeout. Whatever the provider was doing, we're
+                // proceeding to close the file with what we have so the user
+                // can start a new meeting. The mic and engine are already
+                // idle since the stop-button click; only the provider
+                // resources leak (a stuck whisper-cli process or a dead
+                // WebSocket task; both are reclaimed when the next session
+                // overwrites `self.stt` or when the app quits).
+                TrayLog.append("meeting: \(provider) finalize timeout (>10 min) — proceeding to close the transcript file with what arrived")
             }
             self.stt?.disconnect()
             self.stt = nil
@@ -411,7 +430,23 @@ final class MeetingSession {
     }
 
     private func handleError(_ err: Error) {
-        TrayLog.append("meeting: deepgram error — \(err.localizedDescription)")
+        let provider = STTSettings.shared.currentProvider.rawValue
+        TrayLog.append("meeting: \(provider) error — \(err.localizedDescription)")
+        // Treat any provider error as terminal for finalization purposes.
+        //
+        // Background: v1.0.1 made `stop()` wait indefinitely for `sttClosed`
+        // (the flag set in `handleClose`). That assumed every provider that
+        // emits `onError` also eventually emits `onClose`. DeepgramClient
+        // does NOT — when the WebSocket hits a TLS / connection-reset failure
+        // the URLSession-level error path fires but the WS protocol close
+        // never arrives. Result: `sttClosed` stays false forever, the
+        // wait-loop in `stop()` heartbeats `still transcribing` indefinitely,
+        // `isFinalizing` never clears, and every subsequent `start()` is
+        // refused with "Previous meeting is still being transcribed."
+        // Setting `sttClosed=true` here is safe — once an error fires, the
+        // provider will not produce more `onTranscript` events anyway, so
+        // the wait loop has nothing left to wait for.
+        sttClosed = true
     }
 
     private func handleClose(code: Int, reason: String) {

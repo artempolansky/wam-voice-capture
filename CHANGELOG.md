@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.2] — 2026-06-16
+
+Hotfix for a v1.0.1 regression. A real outage on 2026-06-16 at 11:03 confirmed:
+
+- A meeting with Deepgram hit a `TLS error caused the secure connection to fail` mid-stream. The user stopped the meeting normally.
+- v1.0.1's stop() removed the previous 30 s wait deadline (good for legitimate batch-Whisper inference) but assumed every provider that emits `onError` will also eventually emit `onClose`. Deepgram does **not** on TLS / connection-reset — the URLSession-level error fires, the WebSocket protocol close never arrives.
+- Result: `sttClosed` stayed false, the stop() wait loop heartbeat'd `still transcribing (Ns elapsed)…` indefinitely (logged 200+ seconds before user gave up), `isFinalizing` never cleared, every subsequent `start()` was refused with "Previous meeting is still being transcribed". User had to fully quit and relaunch the app to recover. The 11:03 transcript was lost entirely.
+
+### Fixed
+- **Meeting no longer hangs in `isFinalizing` after a Deepgram TLS/connection error.** `MeetingSession.handleError(_)` now flips `sttClosed = true` — a provider that errors out won't produce more `onTranscript` events anyway, so the wait loop has nothing left to wait for. Safe for Whisper too, where the deferred `onClose` would set it again (idempotent).
+- **10-minute hard ceiling on the finalize wait** as a belt-and-suspenders safety net. Covers cases where neither `onClose` nor the new error-driven flip fires (process hang, kernel panic, network-stack failure not surfaced through delegate). Generous enough that legitimate Whisper inference on long meetings (up to ~30-min recordings on the base model) completes well within it. On timeout: a clear log line, then the transcript file is closed with whatever segments arrived and `isFinalizing` clears — no more app-restart-to-recover.
+
+### Known (unchanged from v1.0.1)
+- Whisper still runs as a **single batch invocation** on the full meeting audio at stop time. For very long meetings on `base`, inference can take several minutes — that's normal. The 10-minute ceiling above does **not** cover all pathological cases (e.g. recording a 4-hour meeting on `base` is likely to truncate).
+- LocalCaptureSession (push-to-talk dictation) is unaffected — it had a 5 s deadline from before, which already exits cleanly on TLS errors.
+- Chunked Whisper inference (real architectural fix) still planned for a future release.
+
 ## [1.0.1] — 2026-06-04
 
 Hotfix for v1.0.0 friends-beta — meetings with Local Whisper longer than ~30 seconds came back **empty** because the meeting finalization waited only 30 s for whisper-cli's batch inference, then closed the transcript file (and sent `.done`) before whisper had a chance to emit any segments. v1.0.0 has been re-marked as pre-release; everyone should upgrade.
