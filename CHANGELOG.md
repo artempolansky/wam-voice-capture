@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] — 2026-06-26
+
+Hotfix for a long-running Deepgram failure mode confirmed by two field outages: meetings on 2026-06-25 at 16:00 and again on 2026-06-26 produced transcripts that **stop emitting at the N-th minute** (range 11–25 min) while the meeting itself appears to be running normally. User notices the silence only when reviewing the file later.
+
+### Root cause
+`MeetingSession.scheduleReconnect()` was wired only to `provider.onClose`. But Deepgram's URLSession-backed WebSocket frequently emits `onError` without a subsequent `onClose` on VPN/TLS blips — typical error texts: `Connection reset by peer`, `Operation canceled`, `Broken pipe`, `Socket is not connected`, `bad MAC` (OSStatus −9846). When that happens, the meeting keeps capturing audio + the mixer keeps pushing it into a closed socket → the provider keeps emitting `onError` per failed send (50+ identical lines/second), but `scheduleReconnect` never fires. Result: silent transcript stop, log spam, the rest of the meeting unrecoverable.
+
+### Fixed
+- **`MeetingSession.handleError(_)` now also schedules a reconnect** if the meeting is still running and the user hasn't pressed Stop. The existing `scheduleReconnect()` already cancels any in-flight reconnect task before queueing a new one, so a 50-error storm collapses into a single pending reconnect with the exponential backoff (2s → 4s → 6s → … capped at 30s) that was already in place.
+- **`provider.onOpen` now also resets `sttClosed = false`** so a successful reconnect lets a subsequent Stop wait for the new provider's actual `onClose` instead of exiting the wait loop on the stale error-driven flag from the dead socket that preceded the reconnect.
+- **Error log debounce.** Identical error messages within a 10-second window are collapsed into "first occurrence + N more times". The 16:00 outage produced 1000+ identical log lines; the new debounce caps that to roughly one line per actual event.
+
+### Known (unchanged from v1.0.2)
+- **Whisper hangs on long meetings** (≈ 30+ min). `whisper-cli` gets stuck somewhere between "trying to decode with miniaudio" and the first inference chunk on the 200+ MB single WAV we hand it at meeting-stop. CPU stays near zero, process state is `S` (sleeping). The 10-minute hard ceiling from v1.0.2 still kicks in and unhangs `MeetingSession`, but the transcript is empty. The proper fix — chunked Whisper inference during the meeting instead of one batch invocation at the end — is planned for v1.1.0 and is a real refactor; deliberately not in this hotfix.
+
 ## [1.0.2] — 2026-06-16
 
 Hotfix for a v1.0.1 regression. A real outage on 2026-06-16 at 11:03 confirmed:

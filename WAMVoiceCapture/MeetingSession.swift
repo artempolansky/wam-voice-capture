@@ -84,6 +84,17 @@ final class MeetingSession {
     private var reconnectTask: Task<Void, Never>?
     private var stoppingDeliberately = false
 
+    // Error log debouncing (v1.0.3). A single dead Deepgram WebSocket
+    // produced 50+ identical "Operation canceled" log lines per second in
+    // the 2026-06-25 16:00 outage as the mixer timer kept pushing audio
+    // into a closed socket. This collapses runs of the same error message
+    // within a 10 s window into "first line + count flushed when message
+    // changes or window expires".
+    private var lastErrorMessage: String?
+    private var lastErrorLoggedAt: Date?
+    private var suppressedErrorCount: Int = 0
+    private let errorDebounceWindow: TimeInterval = 10
+
     // File
     private var fileHandle: FileHandle?
 
@@ -129,6 +140,11 @@ final class MeetingSession {
         stoppingDeliberately = false
         reconnectAttempt = 0
         sttClosed = false
+        // Reset error-log debounce — a previous meeting's tail-end
+        // suppression count must not bleed into this one.
+        lastErrorMessage = nil
+        lastErrorLoggedAt = nil
+        suppressedErrorCount = 0
         clearMixerBuffers()
         speakers.reset()
 
@@ -367,6 +383,12 @@ final class MeetingSession {
         provider.onOpen = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.reconnectAttempt = 0
+                // v1.0.3: a fresh socket is open — clear the
+                // error-driven sttClosed flag so a future `stop()` waits
+                // for THIS provider's actual close instead of exiting the
+                // wait loop immediately on the stale flag from the dead
+                // socket that preceded this reconnect.
+                self?.sttClosed = false
                 TrayLog.append("meeting: \(label) opened (multichannel)")
             }
         }
@@ -431,22 +453,54 @@ final class MeetingSession {
 
     private func handleError(_ err: Error) {
         let provider = STTSettings.shared.currentProvider.rawValue
-        TrayLog.append("meeting: \(provider) error — \(err.localizedDescription)")
-        // Treat any provider error as terminal for finalization purposes.
-        //
-        // Background: v1.0.1 made `stop()` wait indefinitely for `sttClosed`
-        // (the flag set in `handleClose`). That assumed every provider that
-        // emits `onError` also eventually emits `onClose`. DeepgramClient
-        // does NOT — when the WebSocket hits a TLS / connection-reset failure
-        // the URLSession-level error path fires but the WS protocol close
-        // never arrives. Result: `sttClosed` stays false forever, the
-        // wait-loop in `stop()` heartbeats `still transcribing` indefinitely,
-        // `isFinalizing` never clears, and every subsequent `start()` is
-        // refused with "Previous meeting is still being transcribed."
-        // Setting `sttClosed=true` here is safe — once an error fires, the
-        // provider will not produce more `onTranscript` events anyway, so
-        // the wait loop has nothing left to wait for.
+        let msg = err.localizedDescription
+        logErrorDebounced(provider: provider, message: msg)
+
+        // Treat error as effective close for the *current* provider — the
+        // finalize wait in `stop()` must not hang if `onClose` never arrives
+        // (the v1.0.2 invariant we still rely on). A successful reconnect
+        // below resets this flag back to false in `provider.onOpen`.
         sttClosed = true
+
+        // v1.0.3: trigger reconnect on provider errors too, not only on
+        // `onClose`. Real-world outage 2026-06-25 16:00 showed Deepgram
+        // emits a stream of URLSession-level errors ("Connection reset by
+        // peer", "Operation canceled") without ever firing the WebSocket
+        // protocol close — meaning `handleClose` never ran and the meeting
+        // went silent for the rest of its duration while still appearing
+        // healthy to the user. We were 11 minutes in; the remaining 49 min
+        // of audio captured nothing.
+        //
+        // `scheduleReconnect()` cancels any in-flight reconnect task before
+        // queueing a new one, so a 50-error storm collapses into a single
+        // pending reconnect with the exponential backoff that's already in
+        // place. The `reconnectAttempt` counter resets in `provider.onOpen`
+        // once the new socket is healthy.
+        guard isRunning, !stoppingDeliberately else { return }
+        scheduleReconnect()
+    }
+
+    /// Log a provider error with debouncing — collapse runs of the same
+    /// message within a 10s window. Called only by handleError.
+    private func logErrorDebounced(provider: String, message: String) {
+        let now = Date()
+        let isSame = (message == lastErrorMessage)
+        let withinWindow = (lastErrorLoggedAt.map { now.timeIntervalSince($0) < errorDebounceWindow } ?? false)
+
+        if isSame && withinWindow {
+            suppressedErrorCount += 1
+            return
+        }
+
+        // Either a new message or the window expired — flush any suppressed
+        // count from the previous burst before emitting the next line.
+        if suppressedErrorCount > 0, let prev = lastErrorMessage {
+            TrayLog.append("meeting: \(provider) error — \"\(prev)\" repeated \(suppressedErrorCount) more times")
+            suppressedErrorCount = 0
+        }
+        TrayLog.append("meeting: \(provider) error — \(message)")
+        lastErrorMessage = message
+        lastErrorLoggedAt = now
     }
 
     private func handleClose(code: Int, reason: String) {
