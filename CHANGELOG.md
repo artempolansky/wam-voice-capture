@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] — 2026-07-09
+
+Every meeting since v1.0.0 shipped with only `Speaker 1` in the transcript — even in call recordings where 2-3 people clearly took turns talking. Confirmed against the last 40 meeting files: `Speaker 2` never appeared once.
+
+### Root cause
+`SpeakerLabels.internalID(channel:dgSpeaker:)` special-cased the mic channel (channel 0) to always return `speaker-1`, discarding Deepgram's per-word `speaker` field for that channel. On a typical single-Mac setup — laptop speakers or headphones playing a Zoom/Meet call, mic picking up both the user and the remote party's voice via acoustic bleed — Deepgram's diarize=true was correctly labelling the two voices as speaker 0 and speaker 1 inside that one channel, but the code was collapsing them into a single label. (System-audio diarization also never surfaced Speaker 2/3 in practice because Screen Recording permission was rarely granted; the fix here still helps that case, but the actual user-visible failure was in the mic path.)
+
+### Fixed
+- `SpeakerLabels` now uses a unified `(channel, dgSpeaker)` ordering across all channels. Speaker N = the N-th distinct `(channel, dgSpeaker)` pair heard in the meeting, in order of first appearance. In practice: the first voice on the mic (you) → Speaker 1, next distinct voice heard (the other party bleeding into the mic, or the same person on system audio if Screen Recording is granted) → Speaker 2, and so on.
+- `activeSpeakers()` / rename API unchanged for the tray menu — the speaker numbering just now reflects reality instead of hard-coding "mic = Speaker 1 forever".
+
+### Not fixed in this release
+- Whisper hang on long meetings (>30 min) — same as v1.0.2 and v1.0.3 KNOWN section. Real fix is chunked Whisper inference (v1.1.0). Recovery script exists for meetings that hit the hang; see the 2026-06-26 recovery flow in the tray log.
+- Local Whisper still doesn't diarize within a channel — it labels everything on the mic side as one speaker regardless. The v1.0.4 fix only affects Deepgram, which does per-word diarization.
+
 ## [1.0.3] — 2026-06-26
 
 Hotfix for a long-running Deepgram failure mode confirmed by two field outages: meetings on 2026-06-25 at 16:00 and again on 2026-06-26 produced transcripts that **stop emitting at the N-th minute** (range 11–25 min) while the meeting itself appears to be running normally. User notices the silence only when reviewing the file later.

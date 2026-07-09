@@ -2,65 +2,71 @@ import Foundation
 
 /// Per-meeting speaker registry.
 ///
-/// Maps Deepgram's per-channel `(channel, speaker_id)` pair to a stable
-/// internal ID and a display label. Mic (channel 0) is always Speaker 1.
-/// System audio (channel 1) speakers are numbered Speaker 2, 3, 4, ... in the
-/// order they first appear in the meeting.
+/// Maps Deepgram's per-final `(channel, speaker_id)` pair to a stable
+/// internal ID + a display label, numbered in order of first appearance
+/// starting at Speaker 1.
+///
+/// **v1.0.4 behavior change.** Before v1.0.4 the mic channel (channel 0)
+/// was hard-locked to Speaker 1 and Deepgram's per-word `speaker` was
+/// discarded there — so if two people spoke through the mic (e.g. laptop
+/// speakers bleeding a call participant's voice back into the built-in
+/// mic, which is the common single-Mac setup), the whole meeting came out
+/// as "Speaker 1" with no way to tell who said what. Now every distinct
+/// `(channel, dgSpeaker)` pair reserves its own slot, and speakers are
+/// numbered in order of first appearance — the very first voice heard
+/// ends up as Speaker 1 (still almost always the user), the second voice
+/// as Speaker 2, and so on.
 ///
 /// User-supplied custom names ("Anya" for Speaker 2) are stored here and
 /// substituted in the transcript file.
 @MainActor
 final class SpeakerLabels {
 
-    /// Stable internal ID, e.g. "speaker-1" (mic), "speaker-2" (system, dg=0),
-    /// "speaker-3" (system, dg=1), ...
+    /// Stable internal ID: "speaker-1", "speaker-2", ... assigned in order
+    /// of first appearance (any channel).
     typealias InternalID = String
 
     /// Fired when a new speaker appears or an existing one is renamed.
     /// Status bar uses this to refresh the Rename submenu.
     var onChange: (() -> Void)?
 
-    /// Display label currently used in the transcript file. For Speaker N
+    /// Display label currently used in the transcript file. For a speaker
     /// without a custom name, equals "Speaker N". After rename, equals the
-    /// custom name. Tracked separately from `customNames` so the file rewrite
-    /// knows what to find-and-replace.
+    /// custom name. Tracked separately from `customNames` so the file
+    /// rewrite knows what to find-and-replace.
     private var currentLabel: [InternalID: String] = [:]
 
     /// User-supplied custom names. Persists for the meeting; cleared on reset.
     private var customNames: [InternalID: String] = [:]
 
-    /// Order-of-first-appearance for system-audio speakers. Index 0 here
-    /// corresponds to Speaker 2, index 1 → Speaker 3, etc.
-    private var systemSpeakerOrder: [String] = []  // keys "ch1-dg0", "ch1-dg1", ...
-
-    /// True once the mic side has produced any final transcript.
-    private var micSeen: Bool = false
+    /// Order-of-first-appearance for all voices. Index 0 → Speaker 1,
+    /// index 1 → Speaker 2, ... Each entry is a key of the form
+    /// "ch{channel}-dg{dgSpeaker}". A meeting always starts with a single
+    /// entry (whoever spoke first — usually the user on mic) and grows as
+    /// new voices are heard.
+    private var speakerOrder: [String] = []
 
     // MARK: - Lookup
 
     /// Resolve `(channel, dg-speaker)` to a stable internal ID.
     /// Registers the speaker on first sight.
     func internalID(channel: Int, dgSpeaker: Int?) -> InternalID {
-        if channel == 0 {
-            if !micSeen {
-                micSeen = true
-                currentLabel["speaker-1"] = "Speaker 1"
-                onChange?()
-            }
-            return "speaker-1"
-        }
-        // System audio: number speakers in order of first appearance.
+        // Normalize the identity key. dgSpeaker is nil when Deepgram is
+        // running without `diarize=true` (or on a final that has no
+        // words[]); treat as speaker 0 within its channel so the numbering
+        // stays deterministic.
         let key = "ch\(channel)-dg\(dgSpeaker ?? 0)"
-        if !systemSpeakerOrder.contains(key) {
-            systemSpeakerOrder.append(key)
-            let idx = systemSpeakerOrder.count + 1   // Speaker 2, 3, 4, ...
-            let id = "speaker-\(idx)"
-            currentLabel[id] = "Speaker \(idx)"
-            onChange?()
-            return id
+
+        if let existing = speakerOrder.firstIndex(of: key) {
+            return "speaker-\(existing + 1)"
         }
-        let idx = systemSpeakerOrder.firstIndex(of: key)! + 2
-        return "speaker-\(idx)"
+
+        speakerOrder.append(key)
+        let idx = speakerOrder.count   // Speaker 1 on first call, then 2, 3, ...
+        let id = "speaker-\(idx)"
+        currentLabel[id] = "Speaker \(idx)"
+        onChange?()
+        return id
     }
 
     /// Display label as it appears in the transcript file right now.
@@ -72,12 +78,9 @@ final class SpeakerLabels {
     /// Used by the tray menu to list active speakers.
     func activeSpeakers() -> [(id: InternalID, label: String)] {
         var out: [(InternalID, String)] = []
-        if micSeen {
-            out.append(("speaker-1", currentLabel["speaker-1"] ?? "Speaker 1"))
-        }
-        for (i, _) in systemSpeakerOrder.enumerated() {
-            let id = "speaker-\(i + 2)"
-            out.append((id, currentLabel[id] ?? "Speaker \(i + 2)"))
+        for i in 0..<speakerOrder.count {
+            let id = "speaker-\(i + 1)"
+            out.append((id, currentLabel[id] ?? "Speaker \(i + 1)"))
         }
         return out
     }
@@ -102,8 +105,7 @@ final class SpeakerLabels {
     func reset() {
         currentLabel.removeAll()
         customNames.removeAll()
-        systemSpeakerOrder.removeAll()
-        micSeen = false
+        speakerOrder.removeAll()
         onChange?()
     }
 }
