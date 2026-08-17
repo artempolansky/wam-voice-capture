@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] — 2026-07-09
+
+Cosmetic-but-annoying fix. User on Local Whisper reported "tray icon blinks red during every dictation" — they interpreted it as "the app is broken and my speech is lost." It wasn't. The dictation was working (Whisper batched the audio and pasted the transcript on release), but the tray icon strobed 4 seconds into every session because the watchdog fired `STALLED`.
+
+### Root cause
+`LocalCaptureSession.checkHealth()` runs a stall watchdog that flips true when no transcript arrives within `stallGracePeriod`. That's correct for Deepgram (streaming — no partials means the socket is silently swallowing audio). It's wrong for Local Whisper, which is **batch by design**: no mid-session transcripts, all segments arrive together on `finish()` after the user releases the hotkey. Every Whisper dictation therefore hit STALLED at ~4s, `onStallChange(true)` fired, and the tray icon strobed red at 2Hz until the user released.
+
+### Fixed
+- `checkHealth()` now bails early when the active STT provider is `.whisperLocal`. No stall check, no red strobe on Whisper. Deepgram behavior unchanged.
+
 ## [1.0.4] — 2026-07-09
 
 Every meeting since v1.0.0 shipped with only `Speaker 1` in the transcript — even in call recordings where 2-3 people clearly took turns talking. Confirmed against the last 40 meeting files: `Speaker 2` never appeared once.

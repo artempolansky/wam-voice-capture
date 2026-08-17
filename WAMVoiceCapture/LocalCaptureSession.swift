@@ -225,6 +225,14 @@ final class LocalCaptureSession {
 
     private func checkHealth() {
         guard running, let startedAt = sessionStartedAt else { return }
+        // The watchdog exists to catch a Deepgram socket that opened but is
+        // silently swallowing audio (no partials, no finals). For batch
+        // providers like Local Whisper there are no mid-session transcripts
+        // by design — inference runs on ``finish()``. Firing STALLED on
+        // Whisper is a false alarm that makes the tray icon strobe red 4 s
+        // into every dictation, which the user sees as "the app is broken".
+        // Skip the check entirely for batch providers.
+        if STTSettings.shared.currentProvider == .whisperLocal { return }
         let now = Date()
         let elapsed = now.timeIntervalSince(startedAt)
         var stalled = false
