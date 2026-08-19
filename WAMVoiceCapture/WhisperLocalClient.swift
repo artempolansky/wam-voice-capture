@@ -4,28 +4,39 @@ import Foundation
 /// ``brew install whisper-cpp``. Fully offline — no network calls,
 /// no API keys, no VPN-related drops.
 ///
-/// Lifecycle differs from Deepgram:
+/// **v1.1.0: chunked inference during the meeting.**
 ///
-/// - **Deepgram** is streaming. Each chunk goes over a WebSocket and
-///   partial transcripts arrive while you speak.
-/// - **Whisper-local** is batch. We accumulate every chunk into an
-///   in-memory PCM buffer; when ``finish()`` is called we write a WAV
-///   file and invoke ``whisper-cli`` once. The final transcript arrives
-///   ~1–3 s later (single ``isFinal=true`` event).
+/// Previously we accumulated the entire meeting into one buffer and ran
+/// ``whisper-cli`` once at ``finish()``. That broke down on real usage:
+/// a 60-minute meeting produced a 200+ MB WAV that reliably hung
+/// ``whisper-cli`` inside miniaudio decoding (process in `S` state, near
+/// zero CPU, never returned). The safety-net ceiling in
+/// ``MeetingSession`` would eventually free the app, but the transcript
+/// was empty and the user lost the meeting.
+///
+/// Now: a timer fires every ``flushInterval`` (30 s by default). On each
+/// tick, whatever audio has accumulated since the last flush is swapped
+/// out of the buffer atomically and enqueued to a serial inference
+/// queue. Each chunk is a manageable ~1–2 MB WAV that ``whisper-cli``
+/// processes in a few seconds. Segments arrive live on ``onTranscript``
+/// and MeetingSession appends them to the transcript file as they come.
+/// On ``finish()`` we invalidate the timer, enqueue the remaining
+/// partial chunk, and then enqueue a synthetic-close task — the serial
+/// queue guarantees the close fires after all pending chunks (in-flight
+/// timer chunk + final partial) have completed.
 ///
 /// Trade-offs vs. Deepgram:
 ///
-/// - ✅ Offline; latency-spike resistant
+/// - ✅ Offline; VPN-independent
 /// - ✅ No per-minute API cost
-/// - ❌ No streaming partials (paste only after speech ends)
-/// - ❌ No diarization (no Speaker 2/3 within a channel; channel-based
-///   labeling still works for meetings: mic = Speaker 1, system = Speaker 2)
-/// - ❌ Initial inference latency on first call (Metal shader compile)
+/// - ✅ Live segments (chunked, not batch) — file grows during the meeting
+/// - ❌ ~30-second buffering lag before segments show up
+/// - ❌ No within-channel diarization (channel-based labeling still works)
+/// - ❌ Small edge errors at chunk boundaries (words cut mid-utterance);
+///   MVP accepts this, adding overlap is future work.
 ///
 /// Model lives at
-/// ``~/Library/Application Support/WAM Voice Capture/models/ggml-base.bin``.
-/// First run requires manual download (we don't auto-download in v1 —
-/// see ``docs/whisper-setup.md``).
+/// ``~/Library/Application Support/WAM Voice Capture/models/ggml-<name>.bin``.
 final class WhisperLocalClient: NSObject, STTProvider {
 
     // MARK: STTProvider conformance
@@ -86,8 +97,14 @@ final class WhisperLocalClient: NSObject, STTProvider {
     let channels: Int
 
     /// Language hint for whisper-cli (``ru``, ``en``, ``auto``).
-    /// Deepgram defaults to ``ru`` per real-world testing; keep parity.
     let language: String
+
+    /// How long each chunk of audio is before we invoke whisper-cli on it.
+    /// 30 s matches whisper's native context window — larger risks the
+    /// original hang bug, smaller wastes model-load overhead. Only Meeting
+    /// sessions ever hit this timer; dictations always finish() before
+    /// the first tick.
+    private let flushInterval: TimeInterval = 30
 
     init(channels: Int, language: String = "ru") {
         self.channels = max(1, min(channels, 2))
@@ -101,23 +118,39 @@ final class WhisperLocalClient: NSObject, STTProvider {
 
     private enum Phase {
         case idle
-        case open       // accepting audio
-        case closing    // finish() called, inference in flight
+        case open       // accepting audio, timer flushing chunks
+        case closing    // finish() called, final chunk + close in queue
         case closed
     }
     private var phase: Phase = .idle
 
-    /// Accumulated interleaved-stereo (or mono) Int16 PCM at 16 kHz.
-    /// One whisper-cli invocation processes everything since the last
-    /// ``connect()``.
-    private var buffer = Data()
+    /// Audio accumulated since the last chunk flush. Interleaved-stereo
+    /// (or mono) Int16 PCM at 16 kHz.
+    private var pendingBuffer = Data()
+
+    /// Serial queue that runs `whisper-cli` invocations one at a time.
+    /// Guarantees onTranscript arrives in chronological order across
+    /// chunks, and guarantees the synthetic-close task enqueued in
+    /// `finish()` runs after every prior chunk has completed.
+    private let inferenceQueue = DispatchQueue(
+        label: "com.artempolansky.wam-voice-capture.whisper-inference",
+        qos: .userInitiated
+    )
+
+    /// Timer fires every ``flushInterval`` seconds while the session is
+    /// open, invoking `flushChunk` on the main queue.
+    private var flushTimer: Timer?
+
+    /// Monotonic counter for chunk logging only. Reset in connect().
+    private var chunkCounter: Int = 0
 
     // MARK: - STTProvider methods
 
     func connect() {
         lock.lock()
         phase = .open
-        buffer.removeAll(keepingCapacity: true)
+        pendingBuffer.removeAll(keepingCapacity: true)
+        chunkCounter = 0
         lock.unlock()
 
         // Validate setup once at session start; if anything is missing,
@@ -134,6 +167,20 @@ final class WhisperLocalClient: NSObject, STTProvider {
             return
         }
 
+        // Kick off the chunk flush timer. Timer runs on main runloop; its
+        // callback dispatches the heavy WAV-write + whisper-cli work onto
+        // the serial inference queue so main stays responsive.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.flushTimer?.invalidate()
+            self.flushTimer = Timer.scheduledTimer(
+                withTimeInterval: self.flushInterval,
+                repeats: true
+            ) { [weak self] _ in
+                self?.flushChunk(isFinal: false)
+            }
+        }
+
         // Synthetic "opened" — we have no real connection but the session
         // expects this event to know it's safe to start streaming chunks.
         onOpen?()
@@ -143,28 +190,40 @@ final class WhisperLocalClient: NSObject, STTProvider {
         lock.lock()
         defer { lock.unlock() }
         guard phase == .open else { return }
-        buffer.append(pcm)
+        pendingBuffer.append(pcm)
     }
 
     func finish() {
         lock.lock()
         guard phase == .open else { lock.unlock(); return }
         phase = .closing
-        let snapshot = buffer
-        buffer.removeAll(keepingCapacity: false)
         lock.unlock()
 
-        // STRONG self capture — the calling session typically drops its
-        // reference to us soon after `finish()` (within 1–5 s on dictation,
-        // immediately on meeting stop). With `[weak self]` the inference
-        // background task would observe a dealloc'd self and silently drop
-        // the recording — exactly the symptom that reproduced when meeting
-        // transcripts came back empty. Holding a strong ref here guarantees
-        // whisper-cli runs to completion, and the ``onTranscript`` /
-        // ``onClose`` callbacks fire while the listeners (sessions) are
-        // still alive (sessions are MainActor singletons).
-        DispatchQueue.global(qos: .userInitiated).async {
-            self.runInference(on: snapshot)
+        // Stop firing new chunk flushes. The timer's own callback may already
+        // be in-flight (running on main runloop) — that's fine; if it swaps
+        // out a chunk after we invalidate here, it just gets processed in
+        // order on the inference queue before our final chunk.
+        DispatchQueue.main.async { [weak self] in
+            self?.flushTimer?.invalidate()
+            self?.flushTimer = nil
+        }
+
+        // Flush the last partial chunk (anything since the last timer tick).
+        // Even if the timer never fired (short dictation), this handles the
+        // whole session's audio.
+        flushChunk(isFinal: true)
+
+        // Enqueue a close notifier AFTER the final chunk. The serial queue
+        // guarantees this runs after every prior runInference completes.
+        // STRONG self capture — MeetingSession may release its reference to
+        // us before this fires; we must keep ourselves alive long enough to
+        // notify.
+        inferenceQueue.async {
+            self.lock.lock()
+            self.phase = .closed
+            self.pendingBuffer.removeAll(keepingCapacity: false)
+            self.lock.unlock()
+            self.onClose?(1000, "")
         }
     }
 
@@ -172,33 +231,73 @@ final class WhisperLocalClient: NSObject, STTProvider {
         lock.lock()
         let wasOpen = phase != .closed
         phase = .closed
-        buffer.removeAll(keepingCapacity: false)
+        pendingBuffer.removeAll(keepingCapacity: false)
         lock.unlock()
+
+        DispatchQueue.main.async { [weak self] in
+            self?.flushTimer?.invalidate()
+            self?.flushTimer = nil
+        }
 
         if wasOpen {
             onClose?(1000, "")
         }
     }
 
-    // MARK: - Inference
+    // MARK: - Chunking
 
-    private func runInference(on pcm: Data) {
-        defer {
-            lock.lock(); phase = .closed; lock.unlock()
-            onClose?(1000, "")
-        }
+    /// Atomically swap the pending buffer out, then dispatch inference on it
+    /// via the serial queue. Safe to call from any thread; the swap under
+    /// the lock is atomic and short.
+    ///
+    /// Called from:
+    /// - `flushTimer` every `flushInterval` seconds while open
+    /// - `finish()` once with `isFinal=true` to drain the tail
+    ///
+    /// A chunk with less than ~200 ms of audio (below `minChunkBytes`) is
+    /// skipped — whisper-cli's model-load overhead alone dwarfs the value
+    /// of transcribing a fragment that short, and it produces lots of
+    /// hallucinations.
+    private func flushChunk(isFinal: Bool) {
+        lock.lock()
+        let chunk = pendingBuffer
+        pendingBuffer.removeAll(keepingCapacity: true)
+        chunkCounter += 1
+        let counter = chunkCounter
+        lock.unlock()
 
-        if pcm.isEmpty {
-            // Nothing to transcribe — synthesize one empty final so callers
-            // that wait for an isFinal event get unblocked.
-            onTranscript?(STTTranscript(text: "", isFinal: true,
-                                        channelIndex: nil, words: []))
+        // Minimum audio to bother invoking whisper: 200 ms per channel.
+        // 200 ms * 16000 Hz * 2 bytes/sample * channels = 6400 * channels.
+        let minChunkBytes = 200 * 16 * 2 * channels
+        if chunk.count < minChunkBytes {
+            if isFinal {
+                TrayLog.append("whisper: skip final chunk #\(counter) — only \(chunk.count) bytes")
+            }
             return
         }
 
-        // Write a 16 kHz WAV with the buffer. For multichannel sessions our
-        // upstream interleaves mic+system into stereo Int16 already, so we
-        // honor the ``channels`` count.
+        // STRONG self capture — see comment in finish() for why.
+        inferenceQueue.async {
+            let ms = chunk.count / (16 * 2 * self.channels)
+            let tag = isFinal ? "final" : "tick"
+            TrayLog.append("whisper: chunk #\(counter) (\(tag), \(ms)ms audio) → inferring")
+            let started = ProcessInfo.processInfo.systemUptime
+            self.runInference(on: chunk)
+            let took = ProcessInfo.processInfo.systemUptime - started
+            TrayLog.append("whisper: chunk #\(counter) done in \(String(format: "%.1f", took))s")
+        }
+    }
+
+    // MARK: - Inference
+
+    /// Process a single chunk of interleaved-stereo (or mono) PCM through
+    /// whisper-cli. Emits onTranscript per segment. Does NOT touch phase
+    /// or fire onClose — the caller (flushChunk + close notifier in
+    /// finish/disconnect) owns lifecycle.
+    private func runInference(on pcm: Data) {
+        if pcm.isEmpty { return }
+
+        // Write a 16 kHz WAV with the chunk.
         let tmpURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("wam-whisper-\(UUID().uuidString).wav")
         defer { try? FileManager.default.removeItem(at: tmpURL) }
@@ -228,9 +327,9 @@ final class WhisperLocalClient: NSObject, STTProvider {
                     try? FileManager.default.removeItem(at: right)
                 }
                 // Skip a channel entirely if it's effectively silent —
-                // tiny model otherwise hallucinates "АПЛОДИСМЕНТЫ" etc. on
-                // pure silence. Threshold of 80 is just above ambient noise
-                // floor for our 16-bit PCM (max amplitude is 32767).
+                // small models otherwise hallucinate "АПЛОДИСМЕНТЫ" etc.
+                // on pure silence. Threshold of 80 is just above ambient
+                // noise floor for our 16-bit PCM (max amplitude 32767).
                 if WAVWriter.rms(of: left) >= 80 {
                     try invokeWhisper(wav: left, channelIndex: 0)
                 }
@@ -302,19 +401,15 @@ final class WhisperLocalClient: NSObject, STTProvider {
     }
 
     /// Parse whisper-cli's `--output-json` and emit one ``STTTranscript`` per
-    /// segment so the meeting transcript file streams in roughly the same
-    /// shape Deepgram produces.
+    /// segment.
     ///
     /// Two cleanups applied:
     ///
     /// 1. Strip any leftover `[_*_]` special tokens (BOS / EOT / timestamp
     ///    markers). They shouldn't appear with plain `--output-json`, but
     ///    we filter defensively.
-    /// 2. Drop consecutive segments with identical text. The ``tiny`` model
-    ///    hallucinates on silence and on background noise, repeating the
-    ///    same short phrase ("Так.", "АПЛОДИСМЕНТЫ") many times in a row.
-    ///    For larger models this is rare; for tiny it's the dominant
-    ///    failure mode and worth filtering at the source.
+    /// 2. Drop consecutive segments with identical text — small models
+    ///    hallucinate on silence, repeating the same phrase many times.
     private func parseWhisperJSON(_ data: Data, channelIndex: Int?) {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let transcription = obj["transcription"] as? [[String: Any]] else {
@@ -325,7 +420,6 @@ final class WhisperLocalClient: NSObject, STTProvider {
             guard let raw = segment["text"] as? String else { continue }
             let cleaned = Self.cleanSegmentText(raw)
             guard !cleaned.isEmpty else { continue }
-            // Drop consecutive duplicates from tiny-model hallucination loops.
             if cleaned == lastEmitted { continue }
             lastEmitted = cleaned
 
@@ -333,7 +427,7 @@ final class WhisperLocalClient: NSObject, STTProvider {
                 text: cleaned,
                 isFinal: true,
                 channelIndex: channelIndex,
-                words: []   // word-level info dropped — segment text is enough
+                words: []
             ))
         }
     }
@@ -350,17 +444,11 @@ final class WhisperLocalClient: NSObject, STTProvider {
         let stripped = specialTokenRegex.stringByReplacingMatches(
             in: raw, options: [], range: range, withTemplate: ""
         )
-        // Collapse runs of whitespace into a single space (whisper.cpp
-        // sometimes inserts spaces around the stripped tokens).
         let collapsed = stripped
             .components(separatedBy: .whitespacesAndNewlines)
             .filter { !$0.isEmpty }
             .joined(separator: " ")
 
-        // Filter known whisper hallucinations on silence / pauses. The
-        // model was trained on YouTube subtitles and reflexively inserts
-        // these phrases at the end of audio or during quiet stretches —
-        // they are NOT what the user said and must not enter the transcript.
         if isHallucinationPhrase(collapsed) {
             return ""
         }
@@ -368,12 +456,14 @@ final class WhisperLocalClient: NSObject, STTProvider {
     }
 
     /// Lowercased phrases that whisper-cli regularly hallucinates from
-    /// nothing. We match the trimmed lowercased candidate against this set
-    /// exactly (after stripping trailing dots/dashes), so legitimate text
-    /// that just happens to contain a fragment is not dropped.
+    /// nothing (silence, background noise, tail-end padding of a chunk).
+    /// We match the trimmed lowercased candidate against this set exactly
+    /// (after stripping trailing dots/dashes), so legitimate text that
+    /// just happens to contain a fragment is not dropped.
     private static let hallucinationPhrases: Set<String> = [
-        // Russian YouTube subtitle reflexes — by far the most common,
-        // produced on near-silence or as a "graceful close" by smaller models.
+        // Russian YouTube subtitle reflexes — the model was trained on
+        // subtitled Russian video and reflexively closes silent segments
+        // with these phrases. Most common failure mode by far.
         "продолжение следует",
         "продолжение следует в следующей серии",
         "спасибо за просмотр",
@@ -383,6 +473,13 @@ final class WhisperLocalClient: NSObject, STTProvider {
         "ставьте лайки",
         "субтитры подготовил",
         "субтитры сделал",
+        // Russian TV-credits variants observed in field recovery runs
+        // (2026-06-26 and 2026-08-19 meetings).
+        "субтитры создавал dimatorzok",
+        "субтитры делал dimatorzok",
+        "редактор субтитров а.кулакова",
+        "редактор субтитров н.закомолдина",
+        "корректор а.егорова",
         // English equivalents
         "thanks for watching",
         "thank you for watching",
@@ -403,9 +500,6 @@ final class WhisperLocalClient: NSObject, STTProvider {
     ]
 
     private static func isHallucinationPhrase(_ text: String) -> Bool {
-        // Trim leading/trailing whitespace + a few terminal punctuation
-        // characters so "Продолжение следует..." matches as well as
-        // "продолжение следует !".
         let punctuation = CharacterSet(charactersIn: ".!?…-—:; ")
         let candidate = text
             .lowercased()
@@ -522,7 +616,7 @@ enum WAVWriter {
 
     /// Read a mono Int16 WAV (with the 44-byte header we write above) and
     /// compute the root-mean-square amplitude. Used to skip whisper
-    /// inference on silent channels — tiny model hallucinates badly on
+    /// inference on silent channels — small models hallucinate badly on
     /// pure silence.
     static func rms(of url: URL) -> Double {
         guard let data = try? Data(contentsOf: url), data.count > 44 else {
