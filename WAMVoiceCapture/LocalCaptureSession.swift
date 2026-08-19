@@ -47,6 +47,23 @@ final class LocalCaptureSession {
     private var deepgramClosed = false
     private var deepgramOpened = false
 
+    // Dictation resilience (v1.2.0). Field data: 168 dictations pasted
+    // 0 chars because the WS handshake failed once and there was no second
+    // attempt, while meetings on the same network survived via
+    // reconnect-with-backoff (2203 reconnects logged, up to attempt 244).
+    // Dictation gets the same semantics: audio accumulates in `audioTap`
+    // for the whole session; on connection failure we retry the WS with
+    // the full buffer; if the WS never comes up by stop(), we POST the
+    // buffer to Deepgram's REST endpoint as a last resort.
+    private let audioTap = DictationAudioTap()
+    private var apiKey: String = ""
+    private var retryTask: Task<Void, Never>?
+    private var retryAttempt = 0
+    private let retryDelay: TimeInterval = 0.6
+    /// Set when the current provider reported an error or closed while the
+    /// session is still running — signals the retry loop to rebuild.
+    private var connectionDead = false
+
     // Watchdog
     private var transcriptsReceived = 0
     private var sessionStartedAt: Date?
@@ -70,6 +87,7 @@ final class LocalCaptureSession {
         let preRoll = try validateAudio()
 
         resetSessionState()
+        apiKey = key
 
         let provider = prepareSTT(apiKey: key)
         provider.connect()
@@ -79,6 +97,7 @@ final class LocalCaptureSession {
         armWatchdog()
 
         running = true
+        armRetryLoop()
         LightControl.shared.set(.recording)
     }
 
@@ -92,6 +111,8 @@ final class LocalCaptureSession {
         LightControl.shared.set(.processing)
         watchdog?.invalidate()
         watchdog = nil
+        retryTask?.cancel()
+        retryTask = nil
         if isStalled { onStallChange?(false); isStalled = false }
 
         let levelSample = AudioCapture.shared.preRollSnapshot()
@@ -139,6 +160,9 @@ final class LocalCaptureSession {
         sessionStartedAt = Date()
         lastTranscriptAt = nil
         isStalled = false
+        audioTap.reset()
+        retryAttempt = 0
+        connectionDead = false
     }
 
     private func prepareSTT(apiKey: String) -> STTProvider {
@@ -149,7 +173,9 @@ final class LocalCaptureSession {
         let providerLabel = STTSettings.shared.currentProvider.rawValue
         stt.onOpen = { [weak self] in
             Task { @MainActor [weak self] in
-                self?.deepgramOpened = true
+                guard let self else { return }
+                self.deepgramOpened = true
+                self.connectionDead = false
                 TrayLog.append("local: \(providerLabel) opened")
             }
         }
@@ -161,7 +187,13 @@ final class LocalCaptureSession {
         }
         stt.onClose = { [weak self] code, reason in
             Task { @MainActor [weak self] in
-                self?.deepgramClosed = true
+                guard let self else { return }
+                self.deepgramClosed = true
+                // A close while the session is still running means the
+                // provider died under us — flag it so the retry loop
+                // rebuilds. (Deliberate closes happen after `running`
+                // flips false in stop(), so this doesn't misfire.)
+                if self.running { self.connectionDead = true }
                 // Reason is Deepgram's server-side close message — e.g.
                 // "Deepgram did not receive audio data or a text message
                 // within the timeout window". Logging it for parity with
@@ -173,17 +205,63 @@ final class LocalCaptureSession {
         return stt
     }
 
-    /// Subscribes the live audio fanout to the STT provider and ships the
-    /// pre-roll snapshot. The subscription handler captures `stt` directly
-    /// (not `self`) so it doesn't need to cross the MainActor boundary on the
-    /// audio render thread.
+    /// Subscribes the live audio fanout. Every chunk goes through
+    /// ``audioTap``, which (a) accumulates the full session audio for
+    /// retry/REST-fallback use and (b) forwards to whatever STT provider
+    /// is currently attached — the indirection is what lets the retry loop
+    /// swap in a fresh provider mid-session without resubscribing.
+    /// The tap is a plain (non-MainActor) class so the audio render thread
+    /// never hops actors.
     private func attachAudio(stt: STTProvider, preRoll: Data) {
         if !preRoll.isEmpty {
+            audioTap.seed(preRoll)
             stt.sendAudio(preRoll)
             TrayLog.append("local: pre-roll \(preRoll.count) bytes flushed")
         }
-        audioSubscription = AudioCapture.shared.subscribe { [weak stt] chunk in
-            stt?.sendAudio(chunk)
+        audioTap.setTarget(stt)
+        audioSubscription = AudioCapture.shared.subscribe { [audioTap] chunk in
+            audioTap.ingest(chunk)
+        }
+    }
+
+    /// Poll loop that rebuilds the Deepgram connection while the session is
+    /// running and the current one is dead. Mirrors the meeting-side
+    /// reconnect (v1.0.3) that survives VPN blips via sheer persistence —
+    /// but on each rebuild the ENTIRE session buffer is resent, and
+    /// collected finals are discarded, so the fresh connection owns the
+    /// whole transcript (no seams, no duplicates).
+    ///
+    /// Whisper never enters this loop: it's local, its `connect()` cannot
+    /// fail transiently.
+    private func armRetryLoop() {
+        guard STTSettings.shared.currentProvider == .deepgram else { return }
+        retryTask?.cancel()
+        retryTask = Task { @MainActor [weak self] in
+            while let self, self.running, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(self.retryDelay * 1_000_000_000))
+                guard self.running, !Task.isCancelled else { return }
+                guard self.connectionDead else { continue }
+
+                self.retryAttempt += 1
+                self.connectionDead = false
+                self.deepgramClosed = false
+                self.deepgramOpened = false
+                // The dead connection may have already emitted some finals.
+                // The fresh connection re-transcribes the full buffer, so
+                // drop them — keeping both would duplicate the overlap.
+                self.finalSegments.removeAll()
+                self.lastInterim = ""
+
+                let fresh = self.prepareSTT(apiKey: self.apiKey)
+                self.stt?.disconnect()
+                self.stt = fresh
+                fresh.connect()
+                // Full-buffer replay: DeepgramClient queues audio sent
+                // during the handshake internally, so ordering with the
+                // live chunks that follow via the tap is preserved.
+                let replay = self.audioTap.attachReplacing(fresh)
+                TrayLog.append("local: retry #\(self.retryAttempt) — reconnecting with \(replay) bytes replayed")
+            }
         }
     }
 
@@ -220,6 +298,9 @@ final class LocalCaptureSession {
         let benign = (nse.domain == NSPOSIXErrorDomain && nse.code == 57)
                    || err.localizedDescription.contains("Socket is not connected")
         if benign && !running { return }
+        // Any provider error while the session runs marks the connection
+        // dead — the retry loop rebuilds it with a full-buffer replay.
+        if running { connectionDead = true }
         onError?(err)
     }
 
@@ -283,10 +364,31 @@ final class LocalCaptureSession {
 
         stt?.disconnect()
         stt = nil
+        audioTap.setTarget(nil)
 
         var text = finalSegments.joined(separator: " ")
         if text.isEmpty { text = lastInterim }
         text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Last resort (v1.2.0): the streaming path produced nothing — the
+        // WS never opened (or died and no retry landed in time). We still
+        // hold the entire session's audio in the tap; POST it to Deepgram's
+        // REST endpoint in one shot. A single short HTTPS request survives
+        // VPN conditions that kill long-lived sockets. Same engine, same
+        // params — identical transcription quality, just +1–2 s latency.
+        if text.isEmpty, STTSettings.shared.currentProvider == .deepgram {
+            let pcm = audioTap.snapshot()
+            // Skip if there's nothing worth sending (~< 300 ms of audio).
+            if pcm.count > 10_000 {
+                TrayLog.append("local: streaming produced 0 chars — trying REST fallback (\(pcm.count) bytes)")
+                do {
+                    text = try await DeepgramRESTClient.transcribe(pcm: pcm, apiKey: apiKey)
+                    TrayLog.append("local: REST fallback OK — \(text.count) chars")
+                } catch {
+                    TrayLog.append("local: REST fallback failed — \(error.localizedDescription)")
+                }
+            }
+        }
 
         TrayLog.append("local: pasting \(text.count) chars (finals=\(finalSegments.count), lastInterim=\(lastInterim.count) chars)")
 
@@ -297,6 +399,97 @@ final class LocalCaptureSession {
         // indicator goes away between sessions.
         AudioCapture.shared.stop()
         LightControl.shared.setIdleReflectingMic()
+    }
+}
+
+// MARK: - Dictation audio tap
+
+/// Thread-safe accumulator + router between the audio render thread and
+/// the current STT provider. Two jobs:
+///
+/// 1. **Accumulate** the full session's PCM so the retry loop can replay
+///    it into a fresh connection, and the REST fallback can POST it.
+/// 2. **Route** live chunks to whatever provider is currently attached —
+///    the indirection lets `LocalCaptureSession` swap providers
+///    mid-session (on reconnect) without touching the audio subscription.
+///
+/// Deliberately NOT MainActor: `ingest` runs on the audio render thread
+/// and must not hop actors. All state is guarded by one lock; the
+/// critical sections are tiny (append + pointer read).
+final class DictationAudioTap {
+
+    private let lock = NSLock()
+    private var buffer = Data()
+    private var target: STTProvider?
+
+    /// Hard cap so a forgotten-running dictation can't eat unbounded RAM.
+    /// 20 MB ≈ 10+ minutes of 16 kHz mono Int16 — far beyond any sane
+    /// dictation. Beyond the cap: live forwarding continues, accumulation
+    /// stops (retry/REST would replay a truncated head, which is still
+    /// better than nothing).
+    private let maxBufferBytes = 20 * 1024 * 1024
+
+    /// Render-thread entry point: buffer + forward.
+    func ingest(_ chunk: Data) {
+        lock.lock()
+        if buffer.count < maxBufferBytes { buffer.append(chunk) }
+        let t = target
+        lock.unlock()
+        t?.sendAudio(chunk)
+    }
+
+    /// Pre-roll seeding (already sent to the first provider by the caller —
+    /// only recorded here so retry/REST replays include it).
+    func seed(_ preRoll: Data) {
+        lock.lock()
+        buffer.append(preRoll)
+        lock.unlock()
+    }
+
+    func setTarget(_ provider: STTProvider?) {
+        lock.lock()
+        target = provider
+        lock.unlock()
+    }
+
+    /// Atomically: replay the full buffer into `provider` and make it the
+    /// live target. Both happen under one lock so no live chunk can slip
+    /// in between the replay and the retarget (which would put audio out
+    /// of order on the new connection). The provider's `sendAudio` only
+    /// enqueues internally, so holding the lock across it is fine — worst
+    /// case the render thread waits a few ms once per reconnect.
+    ///
+    /// The replay is sliced into 64 KB pieces: DeepgramClient forwards
+    /// each `sendAudio` call as one WebSocket frame once open, and a
+    /// single multi-megabyte frame is exactly the kind of edge case
+    /// proxies/VPNs love to drop. 64 KB × N behaves like normal streaming.
+    /// Returns the number of bytes replayed (for logging).
+    @discardableResult
+    func attachReplacing(_ provider: STTProvider) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let sliceSize = 64 * 1024
+        var offset = 0
+        while offset < buffer.count {
+            let end = min(offset + sliceSize, buffer.count)
+            provider.sendAudio(buffer.subdata(in: offset..<end))
+            offset = end
+        }
+        target = provider
+        return buffer.count
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return buffer
+    }
+
+    func reset() {
+        lock.lock()
+        buffer.removeAll(keepingCapacity: false)
+        target = nil
+        lock.unlock()
     }
 }
 
