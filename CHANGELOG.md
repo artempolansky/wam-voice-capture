@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-19
+
+**Dictation now survives VPN blips on Deepgram.** Field data made the asymmetry obvious: meetings on Deepgram logged 2203 reconnects (one stretch reached attempt 244) and still produced full transcripts, while dictation pasted **0 chars 168 times** — because meetings retry until the socket comes back and dictation gave up after a single failed handshake. The user experienced this as "the tray icon blinks and nothing pastes" roughly every other dictation.
+
+### Added
+- **Full-session audio buffer** (`DictationAudioTap`): every dictation's PCM (pre-roll included) accumulates in memory for the whole session — a few hundred KB for typical dictations, hard-capped at 20 MB. The tap also routes live chunks to the current provider, which is what makes mid-session provider swaps possible.
+- **Reconnect-with-replay**: if the Deepgram WebSocket errors or closes while you're still dictating, a retry loop rebuilds the connection every 0.6 s. Each fresh connection receives the **entire buffered audio from the start of the dictation** (finals collected by the dead connection are discarded so nothing duplicates). You keep talking; a mid-dictation blip costs nothing.
+- **REST fallback** (`DeepgramRESTClient`): if by the time you tap ⌥ to stop the streaming path has produced zero text, the whole buffer is POSTed to Deepgram's one-shot `/v1/listen` REST endpoint (same nova-3 model, same params → identical quality). A single short HTTPS request survives VPN conditions that kill long-lived sockets. Costs +1–2 s over a healthy stream; returns text where the old code returned nothing.
+
+### Not changed
+- Meetings — already resilient via v1.0.3 reconnect + v1.1.0 chunked Whisper. REST is wrong for hour-long audio anyway.
+- Whisper dictation — local, can't fail transiently, never enters the retry loop.
+
 ## [1.1.0] — 2026-08-19
 
 **Chunked Whisper inference during the meeting.** The architectural fix that was foreshadowed in every 1.0.x release note since v1.0.1. Two field outages made it non-optional:

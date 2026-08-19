@@ -42,6 +42,7 @@ SWIFTC_ARGS=(
   "$ROOT/WAMVoiceCapture/AudioCapture.swift"
   "$ROOT/WAMVoiceCapture/AudioDevices.swift"
   "$ROOT/WAMVoiceCapture/DeepgramClient.swift"
+  "$ROOT/WAMVoiceCapture/DeepgramRESTClient.swift"
   "$ROOT/WAMVoiceCapture/STTProvider.swift"
   "$ROOT/WAMVoiceCapture/STTSettings.swift"
   "$ROOT/WAMVoiceCapture/WhisperLocalClient.swift"
