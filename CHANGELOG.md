@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-08-19
+
+**Chunked Whisper inference during the meeting.** The architectural fix that was foreshadowed in every 1.0.x release note since v1.0.1. Two field outages made it non-optional:
+
+- **2026-06-26:** a 54-minute Whisper meeting hung `whisper-cli` for 7+ minutes on a 207 MB WAV in `read_audio_data: trying to decode with miniaudio` (process `S` state, near-zero CPU). Recovered offline via a chunked replay script; transcript was 696 segments across ~65 min.
+- **2026-08-19:** repeat of the exact same failure at 16:05. Two-hour meeting, 104 MB mic WAV, another 6-min hang. Recovered by the same replay script; 787 real lines of dialog.
+
+Both incidents share one root cause: we accumulated the entire meeting into one giant WAV and fed it to `whisper-cli` at `finish()` time. Beyond ~30 minutes the file crossed some miniaudio / memory-pressure threshold and inference stalled.
+
+### Fixed
+- `WhisperLocalClient` now runs a **flush timer** at 30-second intervals. On each tick it swaps the accumulated audio out of the buffer atomically and dispatches a `whisper-cli` invocation for that chunk on a serial inference queue. Each chunk is a manageable ~1–2 MB WAV that transcribes in a few seconds. Segments arrive live on `onTranscript`; MeetingSession appends them to the transcript file as they come.
+- `finish()` invalidates the timer, enqueues the last partial chunk, and then enqueues a synthetic-close task on the same serial queue. Because the queue is serial, close fires only after every prior chunk has completed — the file always closes with the full transcript, never truncated.
+- 30-second chunk size chosen to match whisper's native context window; larger risked the original hang, smaller wastes model-load overhead per invocation.
+
+### Side effects (deliberate)
+- The transcript **file grows live during the meeting** now, not just at Stop. Agent watchers that already rsync on `appendLine` (the default) will see it fill in near-real-time (~30-second lag). This matches Deepgram's behavior for the first time.
+- On very short dictations (< 200 ms of audio) the flush is skipped — model-load overhead alone is bigger than the value of transcribing a fragment that short. Dictations rarely trip this because `finish()` fires long before the 30-second tick and pushes whatever was recorded, however small.
+- Hallucination filter picked up new variants observed during recovery: "Редактор субтитров Н.Закомолдина", "Редактор субтитров А.Кулакова", "Корректор А.Егорова", "Субтитры создавал/делал dimatorzok". Small-model padding of silent tail regions.
+
+### Not changed
+- Deepgram (streaming) path is untouched — no chunking, no timer. The v1.0.3 reconnect-on-error fix continues to handle its VPN-related failure mode.
+- `LocalCaptureSession` (push-to-talk dictation) uses the same WhisperLocalClient, but dictations are so short that `finish()` fires before the 30 s timer ever ticks — behavior is effectively identical to before.
+- MeetingSession is untouched. The 10-minute finalize ceiling remains as a defense in depth; with chunking it should almost never be hit because the final partial chunk is always < 30 s of audio.
+
+## [1.0.5] — 2026-07-09
+
+Cosmetic-but-annoying fix. User on Local Whisper reported "tray icon blinks red during every dictation" — they interpreted it as "the app is broken and my speech is lost." It wasn't. The dictation was working (Whisper batched the audio and pasted the transcript on release), but the tray icon strobed 4 seconds into every session because the watchdog fired `STALLED`.
+
+### Root cause
+`LocalCaptureSession.checkHealth()` runs a stall watchdog that flips true when no transcript arrives within `stallGracePeriod`. That's correct for Deepgram (streaming — no partials means the socket is silently swallowing audio). It's wrong for Local Whisper, which is **batch by design** (as it was on v1.0.4 — v1.1.0 changes this): no mid-session transcripts, all segments arrived together on `finish()` after the user released the hotkey. Every Whisper dictation therefore hit STALLED at ~4s, `onStallChange(true)` fired, and the tray icon strobed red at 2Hz until the user released.
+
+### Fixed
+- `checkHealth()` now bails early when the active STT provider is `.whisperLocal`. No stall check, no red strobe on Whisper. Deepgram behavior unchanged.
+
 ## [1.0.4] — 2026-07-09
 
 Every meeting since v1.0.0 shipped with only `Speaker 1` in the transcript — even in call recordings where 2-3 people clearly took turns talking. Confirmed against the last 40 meeting files: `Speaker 2` never appeared once.
