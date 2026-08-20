@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>WAM Voice Capture</string>
 	<key>CFBundleExecutable</key>
 	<string>WAMVoiceCapture</string>
 	<key>CFBundleIconFile</key>
@@ -14,34 +16,32 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>WAMVoiceCapture</string>
-	<key>CFBundleDisplayName</key>
-	<string>WAM Voice Capture</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.0</string>
+	<string>1.2.1</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>11</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2026 Artem Polansky. MIT License.</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>WAM Voice Capture needs Accessibility to detect the global hotkey for voice capture start/stop.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
-	<key>NSUserNotificationsUsageDescription</key>
-	<string>Show errors on capture or delivery failure.</string>
-	<key>NSAccessibilityUsageDescription</key>
-	<string>WAM Voice Capture needs Accessibility to detect the global hotkey for voice capture start/stop.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Read calendar events to auto-name meeting transcripts and show today's events in the menu.</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Artem Polansky. MIT License.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>WAM Voice Capture records microphone audio for speech-to-text transcription.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Meeting recording captures system audio so other participants on calls are transcribed alongside your voice.</string>
-	<key>NSCalendarsUsageDescription</key>
-	<string>Read calendar events to auto-name meeting transcripts and show today's events in the menu.</string>
+	<key>NSUserNotificationsUsageDescription</key>
+	<string>Show errors on capture or delivery failure.</string>
 </dict>
 </plist>

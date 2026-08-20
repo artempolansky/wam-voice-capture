@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-08-19
+
+First field test of v1.2.0's dictation resilience (same day) caught three gaps — the retry/replay machinery worked, but lost races it should have won. Log forensics from the failed session:
+
+1. A retry connection completed its WS handshake ~1 s **after** the fixed 5 s drain deadline in `stop()` expired. Its finals — the full dictation, re-transcribed from the replay buffer — arrived just after 0 chars had already been pasted.
+2. The retry loop wiped `finalSegments` at retry **start**, so when a retry never opened, 3 perfectly good finals from the previous connection were discarded (log: `transcripts=3`, `finals=0`).
+3. The REST fallback was single-shot; the same VPN blip that killed the WS ate the one POST too.
+
+### Fixed
+- **Drain deadline extends when a connection opens mid-drain.** On seeing the open, `finish()` is re-sent (the CloseStream issued pre-open can be swallowed by the handshake) and the wait extends 4 s so the late connection's finals land in the paste instead of the void.
+- **Retry now parks collected finals instead of wiping them.** The stash is discarded only when the fresh connection actually opens (its replay re-covers everything). At paste time the stash is the second-to-last resort: live finals → interim → REST fallback → parked finals.
+- **REST fallback tries 3 times, 1 s apart.**
+
+### Notes
+- When the VPN is fully down for the whole dictation (not a blip), Deepgram still can't produce anything — no code fixes that. The tray strobes red (watchdog) during such sessions; switching to Local Whisper (Settings → Speech recognition) is the offline escape hatch.
+
 ## [1.2.0] — 2026-08-19
 
 **Dictation now survives VPN blips on Deepgram.** Field data made the asymmetry obvious: meetings on Deepgram logged 2203 reconnects (one stretch reached attempt 244) and still produced full transcripts, while dictation pasted **0 chars 168 times** — because meetings retry until the socket comes back and dictation gave up after a single failed handshake. The user experienced this as "the tray icon blinks and nothing pastes" roughly every other dictation.
