@@ -63,6 +63,15 @@ final class LocalCaptureSession {
     /// Set when the current provider reported an error or closed while the
     /// session is still running — signals the retry loop to rebuild.
     private var connectionDead = false
+    /// Finals collected by a previous (dead) connection, parked when a retry
+    /// begins. v1.2.0 dropped them outright on retry start — field data
+    /// (2026-08-19) showed a retry that never opened wiping 3 perfectly good
+    /// finals and pasting 0 chars. Now they're parked here and only
+    /// discarded when the fresh connection actually OPENS (its full-buffer
+    /// replay then re-transcribes everything they covered). At paste time
+    /// the stash is the second-to-last resort, just before giving up.
+    private var stashedFinals: [String] = []
+    private var stashedInterim = ""
 
     // Watchdog
     private var transcriptsReceived = 0
@@ -163,6 +172,8 @@ final class LocalCaptureSession {
         audioTap.reset()
         retryAttempt = 0
         connectionDead = false
+        stashedFinals.removeAll()
+        stashedInterim = ""
     }
 
     private func prepareSTT(apiKey: String) -> STTProvider {
@@ -176,6 +187,10 @@ final class LocalCaptureSession {
                 guard let self else { return }
                 self.deepgramOpened = true
                 self.connectionDead = false
+                // The fresh connection owns the transcript now — its replay
+                // re-covers everything the parked finals contained.
+                self.stashedFinals.removeAll()
+                self.stashedInterim = ""
                 TrayLog.append("local: \(providerLabel) opened")
             }
         }
@@ -248,7 +263,15 @@ final class LocalCaptureSession {
                 self.deepgramOpened = false
                 // The dead connection may have already emitted some finals.
                 // The fresh connection re-transcribes the full buffer, so
-                // drop them — keeping both would duplicate the overlap.
+                // they must not CO-EXIST with its output (duplicate overlap)
+                // — but they must survive in the stash in case this retry
+                // never opens (v1.2.0 wiped them here and pasted 0 chars).
+                // The stash is cleared in onOpen, the moment the fresh
+                // connection takes ownership of the transcript.
+                if !self.finalSegments.isEmpty || !self.lastInterim.isEmpty {
+                    self.stashedFinals = self.finalSegments
+                    self.stashedInterim = self.lastInterim
+                }
                 self.finalSegments.removeAll()
                 self.lastInterim = ""
 
@@ -354,9 +377,25 @@ final class LocalCaptureSession {
 
         // Wait for the provider to close — Deepgram closes after flushing
         // finals; Whisper-local closes when inference finishes.
-        let deadline = Date().addingTimeInterval(deepgramFlushDeadline)
+        //
+        // v1.2.1: the deadline EXTENDS if the connection opens mid-drain.
+        // Field data (2026-08-19): a retry connection completed its
+        // handshake ~1 s after the fixed 5 s deadline expired — its finals
+        // (the whole dictation, re-transcribed from the replay buffer)
+        // arrived just after we'd already pasted 0 chars. Now: when we see
+        // the open happen during the drain, we re-send finish() (the one
+        // sent pre-open may have been swallowed by the handshake) and give
+        // the connection 4 more seconds to flush.
+        var deadline = Date().addingTimeInterval(deepgramFlushDeadline)
+        var sawOpenDuringDrain = deepgramOpened
         while !deepgramClosed, Date() < deadline {
             try? await Task.sleep(nanoseconds: 50_000_000)
+            if !sawOpenDuringDrain && deepgramOpened {
+                sawOpenDuringDrain = true
+                stt?.finish()
+                deadline = max(deadline, Date().addingTimeInterval(4.0))
+                TrayLog.append("local: connection opened during drain — extending wait for its finals")
+            }
         }
         if !deepgramClosed {
             TrayLog.append("local: \(providerLabel) close timeout — pasting what we have (opened=\(deepgramOpened), transcripts=\(transcriptsReceived))")
@@ -381,13 +420,34 @@ final class LocalCaptureSession {
             // Skip if there's nothing worth sending (~< 300 ms of audio).
             if pcm.count > 10_000 {
                 TrayLog.append("local: streaming produced 0 chars — trying REST fallback (\(pcm.count) bytes)")
-                do {
-                    text = try await DeepgramRESTClient.transcribe(pcm: pcm, apiKey: apiKey)
-                    TrayLog.append("local: REST fallback OK — \(text.count) chars")
-                } catch {
-                    TrayLog.append("local: REST fallback failed — \(error.localizedDescription)")
+                // Up to 3 attempts, 1 s apart. One attempt proved too
+                // fragile in the field — the same VPN blip that killed the
+                // WS often eats the first POST too, while the second lands.
+                for attempt in 1...3 {
+                    do {
+                        text = try await DeepgramRESTClient.transcribe(pcm: pcm, apiKey: apiKey)
+                        TrayLog.append("local: REST fallback OK (attempt \(attempt)) — \(text.count) chars")
+                        break
+                    } catch {
+                        TrayLog.append("local: REST fallback attempt \(attempt) failed — \(error.localizedDescription)")
+                        if attempt < 3 {
+                            try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        }
+                    }
                 }
             }
+        }
+
+        // Second-to-last resort: a dead connection's parked finals. They
+        // cover the dictation only up to the moment that connection died —
+        // partial, but real text beats pasting nothing. Only reached when
+        // the live finals, the interim, AND the REST fallback all came up
+        // empty.
+        if text.isEmpty, !stashedFinals.isEmpty || !stashedInterim.isEmpty {
+            var stashed = stashedFinals.joined(separator: " ")
+            if stashed.isEmpty { stashed = stashedInterim }
+            text = stashed.trimmingCharacters(in: .whitespacesAndNewlines)
+            TrayLog.append("local: using \(stashedFinals.count) parked finals from the dead connection (\(text.count) chars, may be partial)")
         }
 
         TrayLog.append("local: pasting \(text.count) chars (finals=\(finalSegments.count), lastInterim=\(lastInterim.count) chars)")
